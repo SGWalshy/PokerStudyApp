@@ -1,31 +1,38 @@
-import { NativeTabs } from 'expo-router/unstable-native-tabs';
-import { useColorScheme } from 'react-native';
+import { Icon, Label, NativeTabs } from 'expo-router/unstable-native-tabs';
 
 import { Colors } from '@/constants/theme';
 
 export default function AppTabs() {
-  const scheme = useColorScheme();
-  const colors = Colors[scheme === 'unspecified' ? 'light' : scheme];
+  const C = Colors.light;
 
   return (
     <NativeTabs
-      backgroundColor={colors.background}
-      indicatorColor={colors.backgroundElement}
-      labelStyle={{ selected: { color: colors.text } }}>
+      backgroundColor={C.backgroundElement}
+      indicatorColor={C.backgroundSelected}
+      labelStyle={{ selected: { color: C.tint } }}>
       <NativeTabs.Trigger name="index">
-        <NativeTabs.Trigger.Label>Home</NativeTabs.Trigger.Label>
-        <NativeTabs.Trigger.Icon
-          src={require('@/assets/images/tabIcons/home.png')}
-          renderingMode="template"
-        />
+        <Label>Home</Label>
+        <Icon src={require('@/assets/images/tabIcons/home.png')} />
       </NativeTabs.Trigger>
 
-      <NativeTabs.Trigger name="explore">
-        <NativeTabs.Trigger.Label>Explore</NativeTabs.Trigger.Label>
-        <NativeTabs.Trigger.Icon
-          src={require('@/assets/images/tabIcons/explore.png')}
-          renderingMode="template"
-        />
+      <NativeTabs.Trigger name="hands">
+        <Label>Hands</Label>
+        <Icon src={require('@/assets/images/tabIcons/hands.png')} />
+      </NativeTabs.Trigger>
+
+      <NativeTabs.Trigger name="bankroll">
+        <Label>Bankroll</Label>
+        <Icon src={require('@/assets/images/tabIcons/bankroll.png')} />
+      </NativeTabs.Trigger>
+
+      <NativeTabs.Trigger name="goals">
+        <Label>Goals</Label>
+        <Icon src={require('@/assets/images/tabIcons/goals.png')} />
+      </NativeTabs.Trigger>
+
+      <NativeTabs.Trigger name="groups">
+        <Label>Groups</Label>
+        <Icon src={require('@/assets/images/tabIcons/groups.png')} />
       </NativeTabs.Trigger>
     </NativeTabs>
   );

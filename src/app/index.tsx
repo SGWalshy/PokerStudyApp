@@ -1,98 +1,256 @@
-import * as Device from 'expo-device';
-import { Platform, StyleSheet } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { AnimatedIcon } from '@/components/animated-icon';
-import { HintRow } from '@/components/hint-row';
-import { ThemedText } from '@/components/themed-text';
-import { ThemedView } from '@/components/themed-view';
-import { WebBadge } from '@/components/web-badge';
-import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
+import { BottomTabInset, Colors, Spacing } from '@/constants/theme';
 
-function getDevMenuHint() {
-  if (Platform.OS === 'web') {
-    return <ThemedText type="small">use browser devtools</ThemedText>;
-  }
-  if (Device.isDevice) {
-    return (
-      <ThemedText type="small">
-        shake device or press <ThemedText type="code">m</ThemedText> in terminal
-      </ThemedText>
-    );
-  }
-  const shortcut = Platform.OS === 'android' ? 'cmd+m (or ctrl+m)' : 'cmd+d';
-  return (
-    <ThemedText type="small">
-      press <ThemedText type="code">{shortcut}</ThemedText>
-    </ThemedText>
-  );
+const C = Colors.light;
+
+const STREAK = 7;
+const GOAL_DONE = 12;
+const GOAL_TOTAL = 20;
+const BANKROLL = 2450;
+const WEEKLY_CHANGE = 180;
+const REVIEW_COUNT = 8;
+
+function getGreeting() {
+  const h = new Date().getHours();
+  if (h < 12) return 'Good morning';
+  if (h < 17) return 'Good afternoon';
+  return 'Good evening';
 }
 
 export default function HomeScreen() {
+  const progress = GOAL_DONE / GOAL_TOTAL;
+
   return (
-    <ThemedView style={styles.container}>
-      <SafeAreaView style={styles.safeArea}>
-        <ThemedView style={styles.heroSection}>
-          <AnimatedIcon />
-          <ThemedText type="title" style={styles.title}>
-            Welcome to&nbsp;Expo
-          </ThemedText>
-        </ThemedView>
+    <View style={styles.root}>
+      <SafeAreaView style={styles.safe} edges={['top']}>
+        <ScrollView
+          style={styles.scroll}
+          contentContainerStyle={styles.content}
+          showsVerticalScrollIndicator={false}>
 
-        <ThemedText type="code" style={styles.code}>
-          get started
-        </ThemedText>
+          {/* Header */}
+          <View style={styles.header}>
+            <View>
+              <Text style={styles.brand}>Poker Study</Text>
+              <Text style={styles.greeting}>{getGreeting()}</Text>
+            </View>
+            <View style={styles.streakBadge}>
+              <Text style={styles.streakFire}>🔥</Text>
+              <Text style={styles.streakCount}>{STREAK}</Text>
+            </View>
+          </View>
 
-        <ThemedView type="backgroundElement" style={styles.stepContainer}>
-          <HintRow
-            title="Try editing"
-            hint={<ThemedText type="code">src/app/index.tsx</ThemedText>}
-          />
-          <HintRow title="Dev tools" hint={getDevMenuHint()} />
-          <HintRow
-            title="Fresh start"
-            hint={<ThemedText type="code">npm run reset-project</ThemedText>}
-          />
-        </ThemedView>
+          {/* Weekly Goal */}
+          <View style={styles.card}>
+            <Text style={styles.cardLabel}>Weekly Goal</Text>
+            <Text style={styles.cardStat}>
+              <Text style={styles.statBold}>{GOAL_DONE}</Text>
+              {` of ${GOAL_TOTAL} hands reviewed`}
+            </Text>
+            <View style={styles.track}>
+              <View style={[styles.trackFill, { flex: progress }]} />
+              <View style={{ flex: 1 - progress }} />
+            </View>
+          </View>
 
-        {Platform.OS === 'web' && <WebBadge />}
+          {/* Bankroll */}
+          <View style={styles.card}>
+            <Text style={styles.cardLabel}>Bankroll</Text>
+            <View style={styles.row}>
+              <Text style={styles.bigNumber}>${BANKROLL.toLocaleString()}</Text>
+              <Text style={styles.positive}>+${WEEKLY_CHANGE} this week</Text>
+            </View>
+          </View>
+
+          {/* Review Queue */}
+          <View style={styles.card}>
+            <Text style={styles.cardLabel}>Review Queue</Text>
+            <View style={styles.row}>
+              <Text style={styles.queueCount}>{REVIEW_COUNT} hands waiting</Text>
+              <Pressable
+                style={({ pressed }) => [styles.reviewBtn, pressed && styles.dimmed]}>
+                <Text style={styles.reviewBtnText}>Review</Text>
+              </Pressable>
+            </View>
+          </View>
+        </ScrollView>
+
+        {/* Action buttons */}
+        <View style={styles.actions}>
+          <Pressable
+            style={({ pressed }) => [styles.primaryBtn, pressed && styles.dimmed]}>
+            <Text style={styles.primaryBtnText}>Log Hand</Text>
+          </Pressable>
+          <Pressable
+            style={({ pressed }) => [styles.secondaryBtn, pressed && styles.dimmed]}>
+            <Text style={styles.secondaryBtnText}>Start Session</Text>
+          </Pressable>
+        </View>
       </SafeAreaView>
-    </ThemedView>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
+  root: {
     flex: 1,
-    justifyContent: 'center',
+    backgroundColor: C.background,
+  },
+  safe: {
+    flex: 1,
+  },
+  scroll: {
+    flex: 1,
+  },
+  content: {
+    paddingHorizontal: Spacing.four,
+    paddingTop: Spacing.three,
+    paddingBottom: Spacing.two,
+  },
+
+  // Header
+  header: {
     flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    marginBottom: Spacing.four,
   },
-  safeArea: {
-    flex: 1,
-    paddingHorizontal: Spacing.four,
-    alignItems: 'center',
-    gap: Spacing.three,
-    paddingBottom: BottomTabInset + Spacing.three,
-    maxWidth: MaxContentWidth,
-  },
-  heroSection: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    flex: 1,
-    paddingHorizontal: Spacing.four,
-    gap: Spacing.four,
-  },
-  title: {
-    textAlign: 'center',
-  },
-  code: {
+  brand: {
+    fontSize: 11,
+    fontWeight: '500',
+    color: C.textSecondary,
+    letterSpacing: 1,
     textTransform: 'uppercase',
+    marginBottom: 4,
   },
-  stepContainer: {
-    gap: Spacing.three,
-    alignSelf: 'stretch',
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.four,
-    borderRadius: Spacing.four,
+  greeting: {
+    fontSize: 26,
+    fontWeight: '700',
+    color: C.text,
+    letterSpacing: -0.3,
+  },
+  streakBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: C.backgroundElement,
+    borderRadius: 20,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    gap: 4,
+    marginTop: 4,
+  },
+  streakFire: {
+    fontSize: 15,
+  },
+  streakCount: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: C.tint,
+  },
+
+  // Cards
+  card: {
+    backgroundColor: C.backgroundElement,
+    borderRadius: 16,
+    padding: Spacing.three,
+    marginBottom: Spacing.three,
+  },
+  cardLabel: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: C.textSecondary,
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
+    marginBottom: 8,
+  },
+  cardStat: {
+    fontSize: 16,
+    color: C.text,
+    marginBottom: 12,
+  },
+  statBold: {
+    fontWeight: '700',
+    color: C.text,
+  },
+  track: {
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: C.backgroundSelected,
+    flexDirection: 'row',
+    overflow: 'hidden',
+  },
+  trackFill: {
+    height: 6,
+    backgroundColor: C.tint,
+  },
+  row: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  bigNumber: {
+    fontSize: 30,
+    fontWeight: '700',
+    color: C.text,
+    letterSpacing: -0.5,
+  },
+  positive: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: C.tint,
+  },
+  queueCount: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: C.text,
+  },
+  reviewBtn: {
+    backgroundColor: C.tint,
+    borderRadius: 10,
+    paddingHorizontal: 18,
+    paddingVertical: 9,
+  },
+  reviewBtnText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: C.tintText,
+  },
+
+  // Bottom actions
+  actions: {
+    paddingHorizontal: Spacing.four,
+    paddingTop: Spacing.two,
+    paddingBottom: BottomTabInset + Spacing.three,
+    gap: Spacing.two,
+    backgroundColor: C.background,
+  },
+  primaryBtn: {
+    backgroundColor: C.tint,
+    borderRadius: 14,
+    paddingVertical: 16,
+    alignItems: 'center',
+  },
+  primaryBtnText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: C.tintText,
+  },
+  secondaryBtn: {
+    backgroundColor: C.background,
+    borderRadius: 14,
+    paddingVertical: 15,
+    alignItems: 'center',
+    borderWidth: 1.5,
+    borderColor: C.tint,
+  },
+  secondaryBtnText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: C.tint,
+  },
+  dimmed: {
+    opacity: 0.7,
   },
 });
