@@ -2,12 +2,19 @@ import { useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { LogHandModal } from '@/components/log-hand/log-hand-modal';
+import {
+  HandDraft,
+  POSITION_LABELS,
+  holeCardsLabel,
+  inferLastStreet,
+} from '@/components/log-hand/types';
 import { BottomTabInset, Colors, Spacing } from '@/constants/theme';
 
 const C = Colors.light;
 
 type ReviewStatus = 'unreviewed' | 'in_progress' | 'reviewed';
-type FilterTab = 'all' | 'unreviewed' | 'reviewed' | 'flagged';
+type FilterTab    = 'all' | 'unreviewed' | 'reviewed' | 'flagged';
 
 interface Hand {
   id: string;
@@ -21,56 +28,98 @@ interface Hand {
   flagged: boolean;
 }
 
-const SAMPLE_HANDS: Hand[] = [
-  { id: '1', positions: 'BTN vs BB', holeCards: 'KK', potType: '3-Bet', street: 'Flop', potSize: 42, date: 'Today', status: 'unreviewed', flagged: false },
-  { id: '2', positions: 'CO vs BTN', holeCards: 'AQs', potType: 'SRP', street: 'Turn', potSize: 28, date: 'Today', status: 'in_progress', flagged: true },
-  { id: '3', positions: 'UTG vs BB', holeCards: 'JJ', potType: '3-Bet', street: 'River', potSize: 115, date: 'Yesterday', status: 'reviewed', flagged: false },
-  { id: '4', positions: 'HJ vs CO', holeCards: 'A5s', potType: 'SRP', street: 'Flop', potSize: 18, date: 'Yesterday', status: 'unreviewed', flagged: false },
-  { id: '5', positions: 'SB vs BB', holeCards: 'KQo', potType: 'SRP', street: 'River', potSize: 67, date: 'Jun 23', status: 'reviewed', flagged: true },
-  { id: '6', positions: 'BTN vs SB', holeCards: 'TT', potType: '4-Bet', street: 'Preflop', potSize: 200, date: 'Jun 22', status: 'unreviewed', flagged: false },
-  { id: '7', positions: 'BB vs UTG', holeCards: '87s', potType: 'SRP', street: 'Turn', potSize: 34, date: 'Jun 21', status: 'in_progress', flagged: false },
-  { id: '8', positions: 'CO vs SB', holeCards: 'AA', potType: '3-Bet', street: 'Flop', potSize: 98, date: 'Jun 20', status: 'reviewed', flagged: false },
+// ── Convert a finished draft to a Hand list item ─────────────────────────────
+
+function draftToHand(draft: HandDraft, id: string): Hand {
+  const labels  = POSITION_LABELS[draft.playerCount] ?? [];
+  const heroPos = draft.heroSeat !== null ? (labels[draft.heroSeat] ?? 'BTN') : 'BTN';
+  const villPos = draft.villainSeats.length > 0
+    ? draft.villainSeats.map((s) => labels[s]).join(', ')
+    : 'BB';
+
+  const statusMap: Record<string, ReviewStatus> = {
+    review:      'unreviewed',
+    good:        'reviewed',
+    unsure:      'in_progress',
+    interesting: 'in_progress',
+  };
+
+  return {
+    id,
+    positions: `${heroPos} vs ${villPos}`,
+    holeCards: holeCardsLabel(draft.card1, draft.card2),
+    potType:   draft.potType,
+    street:    inferLastStreet(draft),
+    potSize:   draft.potSizeBB,
+    date:      'Just now',
+    status:    statusMap[draft.tag ?? ''] ?? 'unreviewed',
+    flagged:   draft.tag === 'review',
+  };
+}
+
+// ── Sample seed data ──────────────────────────────────────────────────────────
+
+const SEED_HANDS: Hand[] = [
+  { id: 's1', positions: 'BTN vs BB',  holeCards: 'KK',  potType: '3-Bet', street: 'Flop',    potSize: 42,  date: 'Today',     status: 'unreviewed', flagged: false },
+  { id: 's2', positions: 'CO vs BTN',  holeCards: 'AQs', potType: 'SRP',   street: 'Turn',    potSize: 28,  date: 'Today',     status: 'in_progress',flagged: true  },
+  { id: 's3', positions: 'UTG vs BB',  holeCards: 'JJ',  potType: '3-Bet', street: 'River',   potSize: 115, date: 'Yesterday', status: 'reviewed',   flagged: false },
+  { id: 's4', positions: 'HJ vs CO',   holeCards: 'A5s', potType: 'SRP',   street: 'Flop',    potSize: 18,  date: 'Yesterday', status: 'unreviewed', flagged: false },
+  { id: 's5', positions: 'SB vs BB',   holeCards: 'KQo', potType: 'SRP',   street: 'River',   potSize: 67,  date: 'Jun 23',    status: 'reviewed',   flagged: true  },
+  { id: 's6', positions: 'BTN vs SB',  holeCards: 'TT',  potType: '4-Bet', street: 'Preflop', potSize: 200, date: 'Jun 22',    status: 'unreviewed', flagged: false },
+  { id: 's7', positions: 'BB vs UTG',  holeCards: '87s', potType: 'SRP',   street: 'Turn',    potSize: 34,  date: 'Jun 21',    status: 'in_progress',flagged: false },
+  { id: 's8', positions: 'CO vs SB',   holeCards: 'AA',  potType: '3-Bet', street: 'Flop',    potSize: 98,  date: 'Jun 20',    status: 'reviewed',   flagged: false },
 ];
 
+// ── Status styling maps ───────────────────────────────────────────────────────
+
 const STATUS_DOT: Record<ReviewStatus, string> = {
-  unreviewed: '#E05252',
+  unreviewed:  '#E05252',
   in_progress: '#D9874A',
-  reviewed: '#2E7D52',
+  reviewed:    '#2E7D52',
 };
 
 const STATUS_LABEL: Record<ReviewStatus, string> = {
-  unreviewed: 'Unreviewed',
+  unreviewed:  'Unreviewed',
   in_progress: 'In Progress',
-  reviewed: 'Reviewed',
+  reviewed:    'Reviewed',
 };
 
 const STATUS_BADGE_BG: Record<ReviewStatus, string> = {
-  unreviewed: '#FCE8E8',
+  unreviewed:  '#FCE8E8',
   in_progress: '#FEF0E6',
-  reviewed: '#E6F4EC',
+  reviewed:    '#E6F4EC',
 };
 
 const STATUS_BADGE_TEXT: Record<ReviewStatus, string> = {
-  unreviewed: '#B83232',
+  unreviewed:  '#B83232',
   in_progress: '#A85A1A',
-  reviewed: '#1A5C36',
+  reviewed:    '#1A5C36',
 };
 
 const FILTERS: { key: FilterTab; label: string }[] = [
-  { key: 'all', label: 'All' },
+  { key: 'all',        label: 'All'        },
   { key: 'unreviewed', label: 'Unreviewed' },
-  { key: 'reviewed', label: 'Reviewed' },
-  { key: 'flagged', label: 'Flagged' },
+  { key: 'reviewed',   label: 'Reviewed'   },
+  { key: 'flagged',    label: 'Flagged'    },
 ];
+
+// ── Screen ────────────────────────────────────────────────────────────────────
 
 export default function HandsScreen() {
   const [activeFilter, setActiveFilter] = useState<FilterTab>('all');
-  const [search, setSearch] = useState('');
+  const [search, setSearch]             = useState('');
+  const [showLog, setShowLog]           = useState(false);
+  const [hands, setHands]               = useState<Hand[]>(SEED_HANDS);
 
-  const filtered = SAMPLE_HANDS.filter((h) => {
+  const handleSave = (draft: HandDraft) => {
+    const hand = draftToHand(draft, `h_${Date.now()}`);
+    setHands((prev) => [hand, ...prev]);
+  };
+
+  const filtered = hands.filter((h) => {
     if (activeFilter === 'unreviewed' && h.status !== 'unreviewed') return false;
-    if (activeFilter === 'reviewed' && h.status !== 'reviewed') return false;
-    if (activeFilter === 'flagged' && !h.flagged) return false;
+    if (activeFilter === 'reviewed'   && h.status !== 'reviewed')   return false;
+    if (activeFilter === 'flagged'    && !h.flagged)                return false;
     if (search.trim()) {
       const q = search.toLowerCase();
       if (!h.positions.toLowerCase().includes(q) && !h.holeCards.toLowerCase().includes(q)) return false;
@@ -81,10 +130,12 @@ export default function HandsScreen() {
   return (
     <View style={styles.root}>
       <SafeAreaView style={styles.safe} edges={['top']}>
+
         {/* Header */}
         <View style={styles.header}>
           <Text style={styles.title}>Hands</Text>
           <Pressable
+            onPress={() => setShowLog(true)}
             style={({ pressed }) => [styles.logBtn, pressed && styles.dimmed]}>
             <Text style={styles.logBtnPlus}>+</Text>
             <Text style={styles.logBtnText}>Log Hand</Text>
@@ -158,6 +209,12 @@ export default function HandsScreen() {
           )}
         </ScrollView>
       </SafeAreaView>
+
+      <LogHandModal
+        visible={showLog}
+        onClose={() => setShowLog(false)}
+        onSave={handleSave}
+      />
     </View>
   );
 }
@@ -174,12 +231,7 @@ const styles = StyleSheet.create({
     paddingTop: Spacing.three,
     paddingBottom: Spacing.two,
   },
-  title: {
-    fontSize: 28,
-    fontWeight: '700',
-    color: C.text,
-    letterSpacing: -0.4,
-  },
+  title: { fontSize: 28, fontWeight: '700', color: C.text, letterSpacing: -0.4 },
   logBtn: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -189,17 +241,8 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
     gap: 4,
   },
-  logBtnPlus: {
-    fontSize: 18,
-    fontWeight: '400',
-    color: C.tintText,
-    lineHeight: 20,
-  },
-  logBtnText: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: C.tintText,
-  },
+  logBtnPlus: { fontSize: 18, fontWeight: '400', color: C.tintText, lineHeight: 20 },
+  logBtnText: { fontSize: 14, fontWeight: '600', color: C.tintText },
 
   filterScroll: { flexGrow: 0 },
   filterRow: {
@@ -214,17 +257,9 @@ const styles = StyleSheet.create({
     paddingVertical: 7,
     backgroundColor: C.backgroundElement,
   },
-  filterBadgeActive: {
-    backgroundColor: C.tint,
-  },
-  filterText: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: C.textSecondary,
-  },
-  filterTextActive: {
-    color: C.tintText,
-  },
+  filterBadgeActive: { backgroundColor: C.tint },
+  filterText: { fontSize: 13, fontWeight: '600', color: C.textSecondary },
+  filterTextActive: { color: C.tintText },
 
   searchWrap: {
     flexDirection: 'row',
@@ -237,17 +272,8 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     gap: 8,
   },
-  searchIcon: {
-    fontSize: 18,
-    color: C.textSecondary,
-    transform: [{ scaleX: -1 }],
-  },
-  searchInput: {
-    flex: 1,
-    fontSize: 15,
-    color: C.text,
-    padding: 0,
-  },
+  searchIcon: { fontSize: 18, color: C.textSecondary, transform: [{ scaleX: -1 }] },
+  searchInput: { flex: 1, fontSize: 15, color: C.text, padding: 0 },
 
   list: { flex: 1 },
   listContent: {
@@ -273,47 +299,15 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
     marginBottom: 4,
   },
-  statusDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    marginRight: 7,
-  },
-  handTitle: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: C.text,
-  },
-  handCards: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: C.tint,
-  },
-  flagIcon: {
-    fontSize: 13,
-  },
-  handMeta: {
-    fontSize: 13,
-    color: C.textSecondary,
-    marginLeft: 15,
-  },
-  handRight: {
-    alignItems: 'flex-end',
-    gap: 6,
-  },
-  statusBadge: {
-    borderRadius: 8,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-  },
-  statusBadgeText: {
-    fontSize: 11,
-    fontWeight: '600',
-  },
-  handDate: {
-    fontSize: 12,
-    color: C.textSecondary,
-  },
+  statusDot: { width: 8, height: 8, borderRadius: 4, marginRight: 7 },
+  handTitle:  { fontSize: 15, fontWeight: '700', color: C.text },
+  handCards:  { fontSize: 15, fontWeight: '600', color: C.tint },
+  flagIcon:   { fontSize: 13 },
+  handMeta:   { fontSize: 13, color: C.textSecondary, marginLeft: 15 },
+  handRight:  { alignItems: 'flex-end', gap: 6 },
+  statusBadge: { borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3 },
+  statusBadgeText: { fontSize: 11, fontWeight: '600' },
+  handDate:   { fontSize: 12, color: C.textSecondary },
 
   emptyText: {
     textAlign: 'center',
