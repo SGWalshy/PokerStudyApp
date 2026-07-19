@@ -2,11 +2,13 @@ import { useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { Colors } from '@/constants/theme';
-import { CardType, Rank, RANKS, Suit, SUITS, SUIT_COLORS } from './types';
+import { CardType, Rank, Suit, SUITS, SUIT_COLORS } from './types';
 
 const C = Colors.light;
 
-// ── Single card face ─────────────────────────────────────────────────────────
+// Row layout: 7 ranks in row 1 (A-8), 6 ranks in row 2 (7-2)
+const RANKS_ROW1: Rank[] = ['A', 'K', 'Q', 'J', 'T', '9', '8'];
+const RANKS_ROW2: Rank[] = ['7', '6', '5', '4', '3', '2'];
 
 interface CardFaceProps {
   card: CardType | null;
@@ -21,12 +23,7 @@ export function CardFace({ card, size = 'md', active = false }: CardFaceProps) {
 
   if (!card) {
     return (
-      <View
-        style={[
-          styles.emptyCard,
-          { width: dim, height: dim * 1.4, borderRadius: 8 },
-          active && styles.emptyCardActive,
-        ]}>
+      <View style={[styles.emptyCard, { width: dim, height: dim * 1.4, borderRadius: 8 }, active && styles.emptyCardActive]}>
         <Text style={[styles.emptyCardText, { fontSize: rankFs - 4 }]}>?</Text>
       </View>
     );
@@ -41,8 +38,6 @@ export function CardFace({ card, size = 'md', active = false }: CardFaceProps) {
   );
 }
 
-// ── Card picker (rank → suit selection) ──────────────────────────────────────
-
 interface CardPickerProps {
   cards: (CardType | null)[];
   activeSlot: number;
@@ -50,6 +45,14 @@ interface CardPickerProps {
   onSlotPress: (slot: number) => void;
   onClear?: (slot: number) => void;
   cardSize?: 'sm' | 'md' | 'lg';
+  // Disable specific rank+suit combos already in use
+  usedCards?: CardType[];
+  // Fires once every slot holds a card (after the very last suit tap) so the
+  // parent can auto-advance instead of requiring a separate "Continue" tap.
+  onAllFilled?: () => void;
+  // Mirrors "rank picked, suit not chosen yet" so a parent can warn before
+  // letting the user navigate away with a half-finished card.
+  onPendingChange?: (rank: Rank | null) => void;
 }
 
 export function CardPicker({
@@ -59,8 +62,23 @@ export function CardPicker({
   onSlotPress,
   onClear,
   cardSize = 'lg',
+  usedCards = [],
+  onAllFilled,
+  onPendingChange,
 }: CardPickerProps) {
-  const [pendingRank, setPendingRank] = useState<Rank | null>(null);
+  const [pendingRank, setPendingRankRaw] = useState<Rank | null>(null);
+
+  const setPendingRank = (r: Rank | null) => {
+    setPendingRankRaw(r);
+    onPendingChange?.(r);
+  };
+
+  const isCardUsed = (rank: Rank, suit?: Suit): boolean => {
+    if (suit) {
+      return usedCards.some(c => c.rank === rank && c.suit === suit);
+    }
+    return usedCards.every(c => c.rank === rank); // all 4 suits used
+  };
 
   const handleRank = (rank: Rank) => {
     setPendingRank(rank === pendingRank ? null : rank);
@@ -68,12 +86,47 @@ export function CardPicker({
 
   const handleSuit = (suit: Suit) => {
     if (!pendingRank) return;
-    onCardPicked(activeSlot, { rank: pendingRank, suit });
+    if (isCardUsed(pendingRank, suit)) return;
+    const rank = pendingRank;
+    onCardPicked(activeSlot, { rank, suit });
     setPendingRank(null);
-    // auto-advance slot
-    const nextEmpty = cards.findIndex((c, i) => i !== activeSlot && c === null);
+    const updated = cards.map((c, i) => (i === activeSlot ? { rank, suit } : c));
+    const nextEmpty = updated.findIndex(c => c === null);
     if (nextEmpty !== -1) onSlotPress(nextEmpty);
+    else onAllFilled?.();
   };
+
+  const renderRankRow = (ranks: Rank[]) => (
+    <View style={styles.rankRow}>
+      {ranks.map((r) => {
+        const allUsed = SUITS.every(s => isCardUsed(r, s));
+        const isPending = pendingRank === r;
+        return (
+          <Pressable
+            key={r}
+            onPress={() => !allUsed && handleRank(r)}
+            disabled={allUsed}
+            hitSlop={2}
+            style={{ flex: 1 }}>
+            <View
+              style={[
+                styles.rankBtn,
+                isPending && styles.rankBtnOn,
+                allUsed && styles.rankBtnDisabled,
+              ]}>
+              <Text style={[
+                styles.rankText,
+                isPending && styles.rankTextOn,
+                allUsed && styles.rankTextDisabled,
+              ]}>
+                {r}
+              </Text>
+            </View>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
 
   return (
     <View style={styles.pickerRoot}>
@@ -89,63 +142,48 @@ export function CardPicker({
           </Pressable>
         ))}
       </View>
-      {onClear && (
-        <Text style={styles.clearHint}>Long-press a card to clear it</Text>
-      )}
+      {onClear && <Text style={styles.clearHint}>Long-press to clear</Text>}
 
-      {/* Rank grid */}
-      <View style={styles.rankGrid}>
-        {RANKS.map((r) => (
-          <Pressable
-            key={r}
-            onPress={() => handleRank(r)}
-            style={[styles.rankBtn, pendingRank === r && styles.rankBtnOn]}>
-            <Text style={[styles.rankText, pendingRank === r && styles.rankTextOn]}>
-              {r}
-            </Text>
-          </Pressable>
-        ))}
+      {/* Rank grid: 7 + 6 layout */}
+      {renderRankRow(RANKS_ROW1)}
+      {renderRankRow(RANKS_ROW2)}
+
+      {/* Suit row — sits below the ranks at all times; simply brightens once
+          a rank is pending, with no size change or bounce. */}
+      <View style={[styles.suitRow, pendingRank && styles.suitRowActive]}>
+        {SUITS.map((s) => {
+          const disabled = !pendingRank || isCardUsed(pendingRank, s);
+          return (
+            <Pressable
+              key={s}
+              onPress={() => handleSuit(s)}
+              disabled={disabled}
+              style={[styles.suitBtn, !!pendingRank && styles.suitBtnActive, disabled && styles.suitBtnOff]}>
+              <Text style={[
+                styles.suitText,
+                { color: SUIT_COLORS[s] },
+                disabled && styles.suitTextOff,
+              ]}>
+                {s}
+              </Text>
+            </Pressable>
+          );
+        })}
       </View>
 
-      {/* Suit row */}
-      <View style={styles.suitRow}>
-        {SUITS.map((s) => (
-          <Pressable
-            key={s}
-            onPress={() => handleSuit(s)}
-            disabled={!pendingRank}
-            style={[styles.suitBtn, !pendingRank && styles.suitBtnOff]}>
-            <Text style={[styles.suitText, { color: SUIT_COLORS[s] }, !pendingRank && styles.suitTextOff]}>
-              {s}
-            </Text>
-          </Pressable>
-        ))}
-      </View>
-
-      <Text style={styles.instructions}>
-        {pendingRank ? `Select a suit for ${pendingRank}` : 'Select a rank first'}
+      <Text style={[styles.instructions, pendingRank && styles.instructionsActive]}>
+        {pendingRank ? `Now tap a suit for ${pendingRank} ↑` : 'Tap a rank to start'}
       </Text>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  pickerRoot: { gap: 14 },
+  pickerRoot: { gap: 12 },
 
-  slotsRow: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: 14,
-  },
-  slotWrap: {
-    padding: 3,
-    borderRadius: 10,
-    borderWidth: 2,
-    borderColor: 'transparent',
-  },
-  slotActive: {
-    borderColor: C.tint,
-  },
+  slotsRow: { flexDirection: 'row', justifyContent: 'center', gap: 14 },
+  slotWrap: { padding: 3, borderRadius: 10, borderWidth: 2, borderColor: 'transparent' },
+  slotActive: { borderColor: C.tint },
 
   emptyCard: {
     backgroundColor: C.backgroundElement,
@@ -155,10 +193,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  emptyCardActive: {
-    borderColor: C.tint,
-    backgroundColor: 'rgba(27,67,50,0.06)',
-  },
+  emptyCardActive: { borderColor: C.tint, backgroundColor: 'rgba(27,67,50,0.06)' },
   emptyCardText: { color: C.textSecondary, fontWeight: '600' },
 
   cardFace: {
@@ -175,51 +210,46 @@ const styles = StyleSheet.create({
   cardRank: { fontWeight: '800' },
   cardSuit: { fontWeight: '600' },
 
-  rankGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 7,
-    justifyContent: 'center',
-  },
+  rankRow: { flexDirection: 'row', justifyContent: 'center', gap: 7 },
   rankBtn: {
-    width: 46,
+    minWidth: 44,
     height: 46,
     borderRadius: 10,
     backgroundColor: C.backgroundElement,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  rankBtnOn: { backgroundColor: C.tint },
-  rankText: { fontSize: 18, fontWeight: '700', color: C.text },
-  rankTextOn: { color: C.tintText },
-
-  suitRow: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: 10,
+  rankBtnOn: {
+    backgroundColor: C.tint,
   },
+  rankBtnDisabled: { backgroundColor: C.backgroundSelected, opacity: 0.4 },
+  rankText: { fontSize: 17, fontWeight: '700', color: C.text },
+  rankTextOn: { color: C.tintText },
+  rankTextDisabled: { color: C.textSecondary },
+
+  suitRow: { flexDirection: 'row', justifyContent: 'center', gap: 10 },
   suitBtn: {
     flex: 1,
     height: 56,
-    borderRadius: 12,
+    borderRadius: 14,
     backgroundColor: C.backgroundElement,
     alignItems: 'center',
     justifyContent: 'center',
-    maxWidth: 72,
+    maxWidth: 76,
+    borderWidth: 2,
+    borderColor: 'transparent',
   },
-  suitBtnOff: { opacity: 0.35 },
+  suitRowActive: {},
+  suitBtnActive: {
+    backgroundColor: '#FFFFFF',
+    borderColor: C.tint,
+    opacity: 1,
+  },
+  suitBtnOff: { opacity: 0.3 },
   suitText: { fontSize: 26, fontWeight: '600' },
   suitTextOff: {},
 
-  instructions: {
-    textAlign: 'center',
-    fontSize: 13,
-    color: C.textSecondary,
-  },
-  clearHint: {
-    textAlign: 'center',
-    fontSize: 11,
-    color: C.textSecondary,
-    marginTop: -8,
-  },
+  instructions: { textAlign: 'center', fontSize: 13, color: C.textSecondary },
+  instructionsActive: { color: C.tint, fontWeight: '700' },
+  clearHint: { textAlign: 'center', fontSize: 11, color: C.textSecondary, marginTop: -6 },
 });
