@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   Alert,
+  Animated,
+  Easing,
   Keyboard,
   KeyboardAvoidingView,
+  LayoutAnimation,
   Modal,
   Platform,
   Pressable,
@@ -11,6 +14,8 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  UIManager,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -28,7 +33,6 @@ import {
   POSITION_LABELS,
   Rank,
   ResultType,
-  TagType,
   autoHandName,
   cardLabel,
   buildPreflopInvestments,
@@ -53,6 +57,68 @@ const ACTION_COLORS: Record<string, string> = {
   check: '#2E7D52', call: '#2E7D52', bet: '#1565C0',
   raise: '#C04040', allin: '#C04040', fold: '#888',
 };
+
+// ── Accordion transitions ────────────────────────────────────────────────────
+// Old Android without Fabric needs this opt-in for LayoutAnimation to fire.
+if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
+  UIManager.setLayoutAnimationEnabledExperimental(true);
+}
+
+// Drives the height/layout side of a section collapsing or re-expanding —
+// 250ms ease-out, matching the collapse/expand spec. Newly *appearing*
+// sections get their own explicit slide+fade (AppearingSection, below)
+// instead of LayoutAnimation's "create", so the two don't double-animate;
+// this config only covers resizing an already-mounted section and fading
+// out one that's removed entirely (e.g. a downstream reset).
+const ACCORDION_LAYOUT_ANIM = {
+  duration: 250,
+  update: { type: LayoutAnimation.Types.easeOut },
+  delete: { type: LayoutAnimation.Types.easeOut, property: LayoutAnimation.Properties.opacity },
+};
+
+function animateAccordion() {
+  LayoutAnimation.configureNext(ACCORDION_LAYOUT_ANIM);
+}
+
+// ── Explicit Animated-API pieces ─────────────────────────────────────────────
+// A gentle, fixed-duration "pop" rather than an indeterminate spring — reads
+// as a bounce but still respects an exact 200ms budget.
+const CHECK_BOUNCE_EASING = Easing.out(Easing.back(1.7));
+
+function AnimatedCheckmark() {
+  const scale = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(scale, {
+      toValue: 1,
+      duration: 200,
+      easing: CHECK_BOUNCE_EASING,
+      useNativeDriver: true,
+    }).start();
+  }, [scale]);
+  return (
+    <Animated.Text style={[styles.sectionCheckmark, { transform: [{ scale }] }]}>✓</Animated.Text>
+  );
+}
+
+// Wraps a section that's just appeared in the flow for the first time —
+// slides up 20px while fading in, 300ms ease-out. Mounts once per section
+// (React swaps it in fresh when the section's `step >= N` guard first
+// passes), so the effect firing on mount is exactly the "just appeared" moment.
+function AppearingSection({ children }: { children: ReactNode }) {
+  const translateY = useRef(new Animated.Value(20)).current;
+  const opacity = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(translateY, { toValue: 0, duration: 300, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+      Animated.timing(opacity, { toValue: 1, duration: 300, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+    ]).start();
+  }, [translateY, opacity]);
+  return (
+    <Animated.View style={{ opacity, transform: [{ translateY }] }}>
+      {children}
+    </Animated.View>
+  );
+}
 
 function DoneLink() {
   return (
@@ -138,6 +204,21 @@ function shouldSkipStreetAction(
   const turnSt = computeStreetState(draft.turnActions, flopSt.potBB);
   const liveAfterTurn = liveAfterFlop.filter(a => !turnSt.allInActors.has(a) && !turnSt.foldedActors.has(a));
   return liveAfterTurn.length <= 1;
+}
+
+// A street with zero recorded actions is ambiguous — it could mean everyone
+// checked (real actions, just no chips) or it could mean the street was
+// never actually played because someone was already all-in. Only the
+// latter should say so instead of the misleading "Checked through".
+function isAllInRunout(draft: HandDraft, street: 'flop' | 'turn' | 'river'): boolean {
+  const sbBB    = draft.bigBlind > 0 ? draft.smallBlind / draft.bigBlind : 0.5;
+  const stradBB = draft.straddleEnabled && draft.bigBlind > 0 ? draft.straddleAmount / draft.bigBlind : 0;
+  const pfActorOrder = getFullPreflopActorOrder(draft.playerCount, draft.heroSeat, draft.villainSeats);
+  const pfInitInv     = buildPreflopInvestments(pfActorOrder, sbBB, stradBB, draft.playerCount);
+  const pfState       = computePreflopState(draft.preflopActions, sbBB, stradBB, pfInitInv);
+  const allNamed      = getStreetActors(draft.heroSeat, draft.villainSeats, draft.playerCount, 'postflop');
+  const actingOrder    = allNamed.filter(a => !pfState.foldedActors.has(a));
+  return shouldSkipStreetAction(draft, street, actingOrder);
 }
 
 // ── Primitives ────────────────────────────────────────────────────────────────
@@ -291,12 +372,15 @@ interface ActionInputProps {
   initialSizingBB?: number;
   onConfirm: (action: AnyAction, sizingBB: number) => void;
   onSizingChange?: (sizeBB: number | null) => void;
+  // Fires the moment the sizing panel opens, so the parent can scroll it
+  // (and its Confirm button) into view rather than leaving it below the fold.
+  onSizingOpen?: () => void;
 }
 
 function ActionInput({
   actor, posLabel, currentBetBB, potBB, stackBB, minRaiseBB,
   investedBB, isPreflop, bigBlind, canRaise = true,
-  preSelectedAction, initialSizingBB, onConfirm, onSizingChange,
+  preSelectedAction, initialSizingBB, onConfirm, onSizingChange, onSizingOpen,
 }: ActionInputProps) {
   const isHero    = actor === 'hero';
   const isVillain = actor.startsWith('villain');
@@ -337,6 +421,13 @@ function ActionInput({
     onSizingChange?.(sizingBB);
   };
 
+  // Scroll the sizing panel (and its Confirm button) into view the moment
+  // it opens — otherwise it can render below the fold with nothing to
+  // indicate there's more to see.
+  useEffect(() => {
+    if (showSizing) onSizingOpen?.();
+  }, [showSizing]);
+
   const handleUnit = (u: 'BB' | 'Chips') => {
     if (u === sizeUnit) return;
     if (u === 'Chips' && bigBlind > 0) setTypedText(fmtSize(sizingBB * bigBlind));
@@ -355,18 +446,20 @@ function ActionInput({
     return sizeUnit === 'Chips' && bigBlind > 0 ? n / bigBlind : n;
   })();
 
-  const displaySizing = sizeUnit === 'Chips' && bigBlind > 0
-    ? `${fmtSize(effectiveSizing * bigBlind)} chips`
-    : `${fmtSize(effectiveSizing)}BB`;
-
   const updateSizing = (bb: number) => { setSizingBB(bb); onSizingChange?.(bb); };
 
-  const commitSizing = () => {
-    const sz = Math.max(1, fullStack > 0 ? Math.min(fullStack, effectiveSizing) : effectiveSizing);
+  // Tapping a preset or typing a size only selects/highlights it — Confirm
+  // is the one action that actually commits the raise/bet.
+  const commitSize = (rawSizeBB: number) => {
+    const sz = Math.max(1, fullStack > 0 ? Math.min(fullStack, rawSizeBB) : rawSizeBB);
     onConfirm(raiseAction, sz);
     setShowSizing(false); setTypedText('');
     onSizingChange?.(null);
   };
+
+  const displaySizing = sizeUnit === 'Chips' && bigBlind > 0
+    ? `${fmtSize(effectiveSizing * bigBlind)} chips`
+    : `${fmtSize(effectiveSizing)}BB`;
 
   const quickCommit = (a: AnyAction) => {
     let sz = 0;
@@ -411,17 +504,17 @@ function ActionInput({
 
       <View style={styles.actionBtnsRow}>
         <Pressable onPress={() => quickCommit('fold')}
-          style={({ pressed }) => [styles.actionBtn, { backgroundColor: pressed ? '#C04040' : '#FEE8E8' }, preBtn('fold')]}>
+          style={({ pressed }) => [styles.actionBtn, { borderColor: '#C04040', backgroundColor: pressed ? '#C04040' : '#FEE8E8' }, preBtn('fold')]}>
           <Text style={[styles.actionBtnText, { color: '#C04040' }]}>Fold</Text>
         </Pressable>
 
         {callAmt <= 0
           ? <Pressable onPress={() => quickCommit('check')}
-              style={({ pressed }) => [styles.actionBtn, pressed && { backgroundColor: '#2E7D52' }, preBtn('check')]}>
+              style={({ pressed }) => [styles.actionBtn, { borderColor: '#2E7D52' }, pressed && { backgroundColor: '#2E7D52' }, preBtn('check')]}>
               <Text style={styles.actionBtnText}>Check</Text>
             </Pressable>
           : <Pressable onPress={() => quickCommit('call')}
-              style={({ pressed }) => [styles.actionBtn, pressed && { backgroundColor: '#2E7D52' }, preBtn('call')]}>
+              style={({ pressed }) => [styles.actionBtn, { borderColor: '#2E7D52' }, pressed && { backgroundColor: '#2E7D52' }, preBtn('call')]}>
               <Text style={styles.actionBtnText}>
                 {isCallAllin ? `Call All-In ${fmtSize(fullStack)}BB` : `Call ${fmtSize(callAmt)}BB`}
               </Text>
@@ -430,13 +523,13 @@ function ActionInput({
 
         {canRaise && (
           <Pressable onPress={openSizing}
-            style={({ pressed }) => [styles.actionBtn, showSizing && { backgroundColor: accent }, pressed && { opacity: 0.75 }, preBtn('raise'), preBtn('bet')]}>
+            style={({ pressed }) => [styles.actionBtn, { borderColor: accent }, showSizing && { backgroundColor: accent }, pressed && { opacity: 0.75 }, preBtn('raise'), preBtn('bet')]}>
             <Text style={[styles.actionBtnText, showSizing && { color: '#fff' }]}>{raiseLabel}</Text>
           </Pressable>
         )}
 
         <Pressable onPress={() => quickCommit('allin')}
-          style={({ pressed }) => [styles.actionBtn, pressed && { backgroundColor: '#C04040' }, preBtn('allin')]}>
+          style={({ pressed }) => [styles.actionBtn, { borderColor: '#C04040' }, pressed && { backgroundColor: '#C04040' }, preBtn('allin')]}>
           <Text style={styles.actionBtnText}>All-In</Text>
         </Pressable>
       </View>
@@ -486,11 +579,13 @@ function ActionInput({
                 setTypedText('');
               }}
               keyboardType="numeric" selectTextOnFocus
+              returnKeyType="done"
+              onSubmitEditing={() => Keyboard.dismiss()}
             />
             <UnitToggle unit={sizeUnit} onPress={handleUnit} accent={accent} />
           </View>
 
-          <Pressable onPress={commitSizing}
+          <Pressable onPress={() => commitSize(effectiveSizing)}
             style={({ pressed }) => [styles.confirmBtn, { backgroundColor: accent }, pressed && { opacity: 0.8 }]}>
             <Text style={styles.confirmBtnText}>Confirm {raiseAction === 'raise' ? '↑ Raise' : 'Bet'} {displaySizing}</Text>
           </Pressable>
@@ -500,19 +595,28 @@ function ActionInput({
   );
 }
 
-// ── Header (single scrolling screen — no per-step wizard chrome) ──────────────
+// ── Header (one screen per step, with a title + back button) ──────────────────
 
-const TOTAL_STEPS = 9;
+const TOTAL_STEPS = 10;
+const STEP_TITLES: Record<number, string> = {
+  1: 'Game Type', 2: 'Blinds & Stack', 3: 'Positions', 4: 'Hole Cards', 5: 'Preflop',
+  6: 'Flop', 7: 'Turn', 8: 'River', 9: 'Result', 10: 'Tag & Save',
+};
 
-function ModalHeader({ onClose }: { onClose: () => void }) {
+function StepHeader({ step, onBack, onClose }: { step: number; onBack: () => void; onClose: () => void }) {
   return (
     <View style={styles.header}>
       <View style={styles.headerRow}>
-        <Text style={styles.headerTitle}>Log a Hand</Text>
-        <View style={styles.headerActions}>
-          <Pressable onPress={() => Keyboard.dismiss()} hitSlop={8}>
-            <Text style={styles.headerDoneText}>Done</Text>
-          </Pressable>
+        <View style={styles.headerSide}>
+          {step > 1 && (
+            <Pressable onPress={onBack} style={({ pressed }) => [styles.backBtn, pressed && { opacity: 0.6 }]}>
+              <Text style={styles.backIcon}>‹</Text>
+              <Text style={styles.backLabel}>Back</Text>
+            </Pressable>
+          )}
+        </View>
+        <Text style={styles.headerTitle}>{STEP_TITLES[step] ?? ''}</Text>
+        <View style={[styles.headerSide, styles.headerSideRight]}>
           <Pressable onPress={onClose} style={({ pressed }) => [styles.closeBtn, pressed && { opacity: 0.6 }]}>
             <Text style={styles.closeIcon}>✕</Text>
           </Pressable>
@@ -532,24 +636,46 @@ function StepScroll({ children }: { children: ReactNode }) {
 
 interface StepProps { draft: HandDraft; set: (u: Partial<HandDraft>) => void; onNext: () => void; }
 
-// ── Step 1: Game Setup (type + blinds + stack, one section) ───────────────────
+// ── Step 1: Game Type ─────────────────────────────────────────────────────────
+
+// Full-screen picker — two large bordered buttons filling almost the whole
+// screen. A single tap on either is the whole decision — it selects and
+// immediately advances, no separate confirm step.
+function StepGameType({ set, onNext }: StepProps) {
+  const { height } = useWindowDimensions();
+
+  const pick = (type: 'cash' | 'tournament') => {
+    if (type === 'cash') {
+      set({ gameType: 'cash', stackUnit: '$', bigBlind: INITIAL_DRAFT.cashBB, smallBlind: INITIAL_DRAFT.cashSB });
+    } else {
+      set({ gameType: 'tournament', stackUnit: 'Chips', bigBlind: INITIAL_DRAFT.tournamentBB, smallBlind: INITIAL_DRAFT.tournamentSB });
+    }
+    onNext();
+  };
+
+  return (
+    <View style={[styles.gameTypeScreen, { height: Math.max(400, height * 0.65) }]}>
+      <Pressable onPress={() => pick('cash')}
+        style={({ pressed }) => [styles.gameTypeBtn, pressed && { opacity: 0.85 }]}>
+        <Text style={styles.gameTypeBtnText}>Cash Game</Text>
+      </Pressable>
+      <Pressable onPress={() => pick('tournament')}
+        style={({ pressed }) => [styles.gameTypeBtn, pressed && { opacity: 0.85 }]}>
+        <Text style={styles.gameTypeBtnText}>Tournament</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+// ── Step 2: Blinds & Stack ─────────────────────────────────────────────────────
 
 const CASH_PRESETS = [
   { label: '$1/$2', sb: 1, bb: 2 }, { label: '$1/$3', sb: 1, bb: 3 },
   { label: '$2/$5', sb: 2, bb: 5 }, { label: '$5/$10', sb: 5, bb: 10 },
 ];
 
-function StepGameSetup({ draft, set, onNext }: StepProps) {
+function StepBlinds({ draft, set, onNext }: StepProps) {
   const isCash = draft.gameType === 'cash';
-
-  const pickType = (type: 'cash' | 'tournament') => {
-    if (type === draft.gameType) return;
-    if (type === 'cash') {
-      set({ gameType: 'cash', stackUnit: '$', bigBlind: INITIAL_DRAFT.cashBB, smallBlind: INITIAL_DRAFT.cashSB });
-    } else {
-      set({ gameType: 'tournament', stackUnit: 'Chips', bigBlind: INITIAL_DRAFT.tournamentBB, smallBlind: INITIAL_DRAFT.tournamentSB });
-    }
-  };
   const [stackUnit, setStackUnit] = useState<'BB' | 'Chips'>('BB');
   const [stackText, setStackText] = useState('');
   const stackFocused = useRef(false);
@@ -590,14 +716,6 @@ function StepGameSetup({ draft, set, onNext }: StepProps) {
 
   return (
     <StepScroll>
-      <Label text="Game type" />
-      <View style={styles.chipRow}>
-        <Chip label="Cash Game" active={draft.gameType === 'cash'} onPress={() => pickType('cash')} />
-        <Chip label="Tournament" active={draft.gameType === 'tournament'} onPress={() => pickType('tournament')} />
-      </View>
-
-      {draft.gameType && (
-      <>
       {isCash ? (
         <>
           <Label text="Stakes" />
@@ -714,8 +832,6 @@ function StepGameSetup({ draft, set, onNext }: StepProps) {
       {stackNote() ? <Text style={styles.stackNote}>{stackNote()}</Text> : null}
 
       <NextBtn onPress={onNext} disabled={draft.bigBlind <= 0 || draft.effectiveStack <= 0} />
-      </>
-      )}
     </StepScroll>
   );
 }
@@ -905,7 +1021,7 @@ function StepCards({ draft, set, onNext, onSkip }: StepProps & { onSkip: () => v
 
 // ── Step 5: Preflop ───────────────────────────────────────────────────────────
 
-function StepPreflop({ draft, set, onNext, onFold, onEdit }: StepProps & { onFold: () => void; onEdit: () => void }) {
+function StepPreflop({ draft, set, onNext, onFold, onEdit, onSizingOpen }: StepProps & { onFold: () => void; onEdit: () => void; onSizingOpen?: () => void }) {
   const labels     = POSITION_LABELS[draft.playerCount] ?? [];
   const sbInBB     = draft.bigBlind > 0 ? draft.smallBlind / draft.bigBlind : 0.5;
   const stradMul   = draft.straddleEnabled && draft.bigBlind > 0 ? draft.straddleAmount / draft.bigBlind : 0;
@@ -1200,6 +1316,7 @@ function StepPreflop({ draft, set, onNext, onFold, onEdit }: StepProps & { onFol
             pendingSizingRef.current = sz;
             if (sz !== null) setPerActorSizings(prev => ({ ...prev, [selectedActor]: sz }));
           }}
+          onSizingOpen={onSizingOpen}
         />
       )}
       {bettingDone && !isEditing && (
@@ -1217,7 +1334,10 @@ function StepPreflop({ draft, set, onNext, onFold, onEdit }: StepProps & { onFol
 
 // ── Steps 6/7/8: Street ───────────────────────────────────────────────────────
 
-function StepStreet({ street, phase, onPhaseChange, draft, set, onNext, onFold, onEdit }: StepProps & { street: 'flop' | 'turn' | 'river'; phase: 'cards' | 'action'; onPhaseChange: (p: 'cards' | 'action') => void; onFold: () => void; onEdit: () => void }) {
+function StepStreet({ street, phase, onPhaseChange, draft, set, onNext, onFold, onEdit, onSizingOpen }: StepProps & {
+  street: 'flop' | 'turn' | 'river'; phase: 'cards' | 'action'; onPhaseChange: (p: 'cards' | 'action') => void;
+  onFold: () => void; onEdit: () => void; onSizingOpen?: () => void;
+}) {
   const [cardSlot, setCardSlot] = useState(0);
   const [cardsPending, setCardsPending] = useState<Rank | null>(null);
   const labels    = POSITION_LABELS[draft.playerCount] ?? [];
@@ -1463,6 +1583,7 @@ function StepStreet({ street, phase, onPhaseChange, draft, set, onNext, onFold, 
               isPreflop={false} bigBlind={draft.bigBlind}
               canRaise={canRaise}
               onConfirm={handleAction}
+              onSizingOpen={onSizingOpen}
             />
           ) : bettingDone ? (
             <>
@@ -1567,7 +1688,6 @@ function StepResult({ draft, set, onNext }: StepProps) {
   const [villainSlots, setVillainSlots] = useState<Record<string, number>>({});
   const [confirmedVillains, setConfirmedVillains] = useState<Set<string>>(new Set());
 
-  const dotFor = (a: string) => a === 'hero' ? HERO_COLOR : a.startsWith('villain') ? (VILLAIN_COLORS[parseInt(a.replace('villain',''),10)-1] ?? VILLAIN_COLORS[0]) : UNNAMED_COLOR;
   const nameFor = (a: string) => {
     if (a === 'hero') return `Hero · ${labels[draft.heroSeat??0]??'?'}`;
     if (a.startsWith('villain')) { const vi=parseInt(a.replace('villain',''),10)-1; return `V${vi+1} · ${labels[draft.villainSeats[vi]??0]??'?'}`; }
@@ -1702,36 +1822,6 @@ function StepResult({ draft, set, onNext }: StepProps) {
         </>
       )}
 
-      {/* Hand summary */}
-      <Label text="Hand summary" />
-      <Text style={styles.streetHeader}>PREFLOP</Text>
-      {draft.preflopActions.filter(e => e.actor === 'hero' || e.actor.startsWith('villain'))
-        .map((e, i) => <ActionRow key={i} playerLabel={nameFor(e.actor)} dotColor={dotFor(e.actor)} entry={e} />)}
-      {draft.preflopActions.filter(e => e.actor === 'hero' || e.actor.startsWith('villain')).length === 0 &&
-        <Text style={styles.emptyStreet}>No preflop recorded</Text>}
-
-      {draft.flopCards.some(Boolean) && (
-        <>
-          <Text style={styles.streetHeader}>FLOP  {draft.flopCards.filter(Boolean).map(c => `${c!.rank}${c!.suit}`).join(' ')}</Text>
-          {draft.flopActions.map((e, i) => <ActionRow key={i} playerLabel={nameFor(e.actor)} dotColor={dotFor(e.actor)} entry={e} />)}
-          {draft.flopActions.length === 0 && <Text style={styles.emptyStreet}>Checked through</Text>}
-        </>
-      )}
-      {draft.turnCard && (
-        <>
-          <Text style={styles.streetHeader}>TURN  {draft.turnCard.rank}{draft.turnCard.suit}</Text>
-          {draft.turnActions.map((e, i) => <ActionRow key={i} playerLabel={nameFor(e.actor)} dotColor={dotFor(e.actor)} entry={e} />)}
-          {draft.turnActions.length === 0 && <Text style={styles.emptyStreet}>Checked through</Text>}
-        </>
-      )}
-      {draft.riverCard && (
-        <>
-          <Text style={styles.streetHeader}>RIVER  {draft.riverCard.rank}{draft.riverCard.suit}</Text>
-          {draft.riverActions.map((e, i) => <ActionRow key={i} playerLabel={nameFor(e.actor)} dotColor={dotFor(e.actor)} entry={e} />)}
-          {draft.riverActions.length === 0 && <Text style={styles.emptyStreet}>Checked through</Text>}
-        </>
-      )}
-
       <Pressable onPress={() => Share.share({ message: history }).catch(() => {})}
         style={({ pressed }) => [styles.shareBtn, pressed && { opacity: 0.7 }]}>
         <Text style={styles.shareBtnText}>Share / Copy Hand History</Text>
@@ -1747,35 +1837,21 @@ function StepResult({ draft, set, onNext }: StepProps) {
   );
 }
 
-// ── Step 10: Name & Tag ───────────────────────────────────────────────────────
+// ── Step 9: Name & Save ────────────────────────────────────────────────────────
 
-const TAGS: Array<{ key: TagType; label: string }> = [
-  { key: 'review', label: 'Review Later' }, { key: 'good', label: 'Good Play' },
-  { key: 'unsure', label: 'Unsure' },       { key: 'interesting', label: 'Interesting' },
-];
-
-function StepNameTag({ draft, set, onSave }: StepProps & { onSave: () => void }) {
+function StepNameTag({ draft, set, onSave, onFocusScroll }: StepProps & { onSave: () => void; onFocusScroll?: () => void }) {
   const auto = autoHandName(draft);
   return (
     <StepScroll>
       <Label text="Name this hand" />
       <TextInput style={styles.nameInput} placeholder={auto} placeholderTextColor={C.textSecondary}
         value={draft.handName} onChangeText={(v) => set({ handName: v })} maxLength={80} returnKeyType="done"
-        onSubmitEditing={() => Keyboard.dismiss()} />
+        onSubmitEditing={() => Keyboard.dismiss()} onFocus={onFocusScroll} />
       <Text style={styles.nameHint}>Leave blank to auto-generate: "{auto}"</Text>
-      <Label text="Mark as" />
-      <View style={styles.tagGrid}>
-        {TAGS.map(({ key, label }) => (
-          <Pressable key={key} onPress={() => set({ tag: draft.tag === key ? null : key })}
-            style={({ pressed }) => [styles.tagBtn, draft.tag === key && styles.tagBtnActive, pressed && { opacity: 0.7 }]}>
-            <Text style={[styles.tagLabel, draft.tag === key && styles.tagLabelActive]}>{label}</Text>
-          </Pressable>
-        ))}
-      </View>
       <Label text="Notes" />
       <TextInput style={styles.notesInput} placeholder="Any thoughts on this hand…"
         placeholderTextColor={C.textSecondary} value={draft.notes}
-        onChangeText={(v) => set({ notes: v })} multiline maxLength={300} />
+        onChangeText={(v) => set({ notes: v })} multiline maxLength={300} onFocus={onFocusScroll} />
       <DoneLink />
       <Pressable onPress={onSave} style={({ pressed }) => [styles.saveBtn, pressed && { opacity: 0.8 }]}>
         <Text style={styles.saveBtnText}>Save Hand</Text>
@@ -1831,6 +1907,8 @@ function summaryCards(draft: HandDraft): string {
   return `${cardLabel(draft.card1)}  ${cardLabel(draft.card2)}`;
 }
 
+// Read-only one-line recap — position + shorthand action for every named
+// actor, followed by the pot/board context.
 function summaryPreflop(draft: HandDraft): string {
   const named = draft.preflopActions.filter(e => e.actor === 'hero' || e.actor.startsWith('villain'));
   if (named.length === 0) return 'Skipped';
@@ -1844,7 +1922,13 @@ function summaryStreet(street: 'flop' | 'turn' | 'river', draft: HandDraft): str
     : street === 'turn' ? (draft.turnCard ? cardLabel(draft.turnCard) : '')
     : (draft.riverCard ? cardLabel(draft.riverCard) : '');
   const actions = street === 'flop' ? draft.flopActions : street === 'turn' ? draft.turnActions : draft.riverActions;
-  if (actions.length === 0) return board ? `${board} — checked through` : (board || 'Skipped');
+  if (actions.length === 0) {
+    if (isAllInRunout(draft, street)) {
+      const label = street === 'river' ? 'All in — run out' : 'All in — cards to come';
+      return board ? `${board} — ${label}` : label;
+    }
+    return board || 'Skipped';
+  }
   const parts = actions.map(e => `${abbrevPos(posLabelForActor(draft, e.actor))} ${fmtActionShort(e)}`);
   return `${board} — ${parts.join(' · ')}`;
 }
@@ -1856,33 +1940,70 @@ function summaryResult(draft: HandDraft): string {
   return 'Showdown';
 }
 
+// A street's own labelled boundary — "——— FLOP ———" — used instead of the
+// plain grey label so moving from preflop into a new street reads as
+// crossing into a new chapter of the hand, not more of the same block.
+function StreetDivider({ label }: { label: string }) {
+  return (
+    <View style={styles.streetDividerRow}>
+      <View style={styles.streetDividerLine} />
+      <Text style={styles.streetDividerLabel}>{label}</Text>
+      <View style={styles.streetDividerLine} />
+    </View>
+  );
+}
+
 interface SectionWrapProps {
   title: string;
-  accent?: string;
   summary: string;
   isDone: boolean;
-  onEdit: () => void;
+  // Preflop/Flop/Turn/River use the bolder divider treatment (StreetDivider)
+  // instead of the plain small-caps label every other section gets.
+  divider?: boolean;
+  // Skips the colored left accent bar (and its padding reservation) —
+  // used for the full-screen Game Type picker, which should be plain
+  // outlined boxes with no side decoration at all.
+  noAccent?: boolean;
   children: ReactNode;
 }
 
-// One accordion "row": a compact done-summary with an edit pencil, or the
-// fully expanded, live-editable body when this is the active section.
-function SectionWrap({ title, accent, summary, isDone, onEdit, children }: SectionWrapProps) {
-  if (isDone) {
-    return (
-      <Pressable onPress={onEdit} style={({ pressed }) => [styles.sectionDone, pressed && { opacity: 0.7 }]}>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.sectionDoneTitle}>{title}</Text>
-          <Text style={styles.sectionDoneSummary} numberOfLines={1}>{summary}</Text>
-        </View>
-        <Text style={styles.sectionEditIcon}>✎</Text>
-      </Pressable>
-    );
-  }
+// One screen's section: a persistent label above a card — done, it's a
+// read-only, non-interactive recap row (checkmark + one-line summary);
+// active, it's the fully live-editable body for the step you're currently
+// on (marked out by the green left-border accent). Going back to change an
+// earlier step is done via the screen's own Back button, not by tapping its
+// recap card. The accent is a separate absolutely-positioned bar (not a
+// real border) so it can fade in/out on its own — the card reserves its
+// width permanently via paddingLeft so nothing shifts.
+function SectionWrap({ title, summary, isDone, divider, noAccent, children }: SectionWrapProps) {
+  const accentOpacity = useRef(new Animated.Value(isDone ? 0 : 1)).current;
+  const mountedRef = useRef(false);
+
+  useEffect(() => {
+    if (!mountedRef.current) { mountedRef.current = true; return; }
+    Animated.timing(accentOpacity, {
+      toValue: isDone ? 0 : 1,
+      duration: 200,
+      easing: Easing.out(Easing.ease),
+      useNativeDriver: true,
+    }).start();
+  }, [isDone, accentOpacity]);
+
   return (
-    <View style={styles.sectionActive}>
-      <Text style={[styles.sectionActiveTitle, accent ? { color: accent } : null]}>{title}</Text>
-      {children}
+    <View>
+      {divider ? <StreetDivider label={title} /> : <Text style={styles.sectionLabel}>{title}</Text>}
+      <View style={[styles.sectionCard, noAccent && styles.sectionCardPlain, isDone ? styles.sectionCardDone : styles.sectionCardActive]}>
+        {!noAccent && isDone && <View style={styles.sectionGreyBar} />}
+        {!noAccent && <Animated.View pointerEvents="none" style={[styles.sectionAccentBar, { opacity: accentOpacity }]} />}
+        {isDone ? (
+          <>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.sectionDoneSummary} numberOfLines={1}>{summary}</Text>
+            </View>
+            <AnimatedCheckmark />
+          </>
+        ) : children}
+      </View>
     </View>
   );
 }
@@ -1895,23 +2016,6 @@ export interface LogHandModalProps {
   onSave: (draft: HandDraft) => void;
 }
 
-// Fields owned by each accordion section, in section order (1-9) — used to
-// cascade-reset everything downstream of a section being reopened for
-// editing, since the hand data from that point on may no longer be valid.
-const SECTION_FIELDS: Record<number, (keyof HandDraft)[]> = {
-  1: ['gameType', 'cashSB', 'cashBB', 'stakes', 'tournamentSB', 'tournamentBB', 'bigBlind', 'smallBlind',
-      'straddleEnabled', 'straddleAmount', 'anteType', 'anteAmount', 'playerCount',
-      'effectiveStack', 'stackUnit', 'effectiveStackBB'],
-  2: ['heroSeat', 'villainSeats', 'villainStacksBB'],
-  3: ['card1', 'card2'],
-  4: ['preflopActions', 'preflopComplete', 'potType', 'preflopPotBB'],
-  5: ['flopCards', 'flopActions', 'flopComplete'],
-  6: ['turnCard', 'turnActions', 'turnComplete'],
-  7: ['riverCard', 'riverActions', 'riverComplete'],
-  8: ['heroFolded', 'foldedOn', 'lastStreet', 'villainMucked', 'result', 'potSizeBB', 'villainHoleCards'],
-  9: ['handName', 'tag', 'notes'],
-};
-
 export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
   const [step,  setStep]  = useState(1);
   const [draft, setDraft] = useState<HandDraft>(INITIAL_DRAFT);
@@ -1919,10 +2023,15 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
   const [turnPhase,  setTurnPhase]  = useState<'cards' | 'action'>('cards');
   const [riverPhase, setRiverPhase] = useState<'cards' | 'action'>('cards');
   const scrollRef = useRef<ScrollView>(null);
+  const progressAnim = useRef(new Animated.Value(0)).current;
+  // Shared by the notes field's focus handler and the raise/bet sizing
+  // panel's open handler — both need "reveal the newly-grown bottom of the
+  // screen" and neither can reach scrollRef directly.
+  const scrollToEndSoon = () => setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
 
   const set  = (u: Partial<HandDraft>) => setDraft(prev => ({ ...prev, ...u }));
-  const next = () => setStep(s => Math.min(s + 1, TOTAL_STEPS));
-  const skip = () => setStep(8); // hand-ending fold — jump straight to Result
+  const next = () => { animateAccordion(); setStep(s => Math.min(s + 1, TOTAL_STEPS)); };
+  const skip = () => { animateAccordion(); setStep(9); }; // hand-ending fold — jump straight to Result
 
   // Editing a street's actions invalidates whatever later streets recorded
   // off the old outcome (pot size, who's still live) and any fold
@@ -1947,16 +2056,19 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
     }
   };
 
-  // Pencil-edit a completed section: reopen it, and wipe every section after
-  // it, since a change here can invalidate all the hand data built on top.
-  const editSection = (i: number) => {
-    const resets: Partial<HandDraft> = {};
-    for (let g = i + 1; g <= 9; g++) {
-      for (const key of SECTION_FIELDS[g]) (resets as any)[key] = (INITIAL_DRAFT as any)[key];
-    }
-    setDraft(prev => ({ ...prev, ...resets }));
-    setFlopPhase('cards'); setTurnPhase('cards'); setRiverPhase('cards');
-    setStep(i);
+  // Back steps one screen at a time — a street's own cards/action sub-phase
+  // counts as a step in its own right so Back peels those off first before
+  // moving to the previous street. Editing something after going back is
+  // handled the same way it always is: committing a new action calls
+  // clearAfter above, which invalidates whatever was built on top of it.
+  const back = () => {
+    animateAccordion();
+    if (step === 6 && flopPhase === 'action')  { setFlopPhase('cards');  return; }
+    if (step === 7 && turnPhase === 'action')  { setTurnPhase('cards');  return; }
+    if (step === 7 && turnPhase === 'cards')   { setFlopPhase('action'); setStep(6); return; }
+    if (step === 8 && riverPhase === 'action') { setRiverPhase('cards'); return; }
+    if (step === 8 && riverPhase === 'cards')  { setTurnPhase('action'); setStep(7); return; }
+    setStep(s => Math.max(1, s - 1));
   };
 
   const handleClose = () => {
@@ -1966,6 +2078,20 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
   };
   const handleSave  = () => { onSave(draft); handleClose(); };
 
+  // The X button (and Android's hardware back) must always ask before
+  // throwing away whatever's been entered — works the same at every step
+  // since it doesn't depend on any in-progress UI state.
+  const confirmClose = () => {
+    Alert.alert(
+      'Discard this hand?',
+      'Your progress will be lost',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Discard', style: 'destructive', onPress: handleClose },
+      ],
+    );
+  };
+
   // The hand is built top-to-bottom in real time — every time a new section
   // becomes active, scroll down to reveal it.
   useEffect(() => {
@@ -1973,84 +2099,145 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
     return () => clearTimeout(t);
   }, [step, flopPhase, turnPhase, riverPhase]);
 
+  // Progress bar always transitions smoothly to the new percentage —
+  // never a hard jump — regardless of which direction step moved.
+  useEffect(() => {
+    Animated.timing(progressAnim, {
+      toValue: Math.min(1, (step - 1) / TOTAL_STEPS),
+      duration: 400,
+      easing: Easing.inOut(Easing.ease),
+      useNativeDriver: false, // width isn't supported by the native driver
+    }).start();
+  }, [step, progressAnim]);
+
+  // Nothing ever sits below the Notes field, so once the keyboard opens for
+  // it (or the name field just above it) the fix is always the same: reveal
+  // the bottom of the scroll content, which is exactly what's newly hidden
+  // behind the keyboard.
+  useEffect(() => {
+    const sub = Keyboard.addListener(
+      Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow',
+      () => scrollRef.current?.scrollToEnd({ animated: true }),
+    );
+    return () => sub.remove();
+  }, []);
+
   // A street section only exists once it's actually been reached — either
   // it's the active step right now, or its *Complete flag says it was
   // finished earlier (covers both normal advance and a fold jumping ahead).
-  const showFlop  = draft.flopComplete  || step === 5;
-  const showTurn  = draft.turnComplete  || step === 6;
-  const showRiver = draft.riverComplete || step === 7;
+  const showFlop  = draft.flopComplete  || step === 6;
+  const showTurn  = draft.turnComplete  || step === 7;
+  const showRiver = draft.riverComplete || step === 8;
 
   return (
-    <Modal visible={visible} animationType="slide" presentationStyle="fullScreen" onRequestClose={handleClose}>
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+    <Modal visible={visible} animationType="slide" presentationStyle="fullScreen" onRequestClose={confirmClose}>
+      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         <SafeAreaView style={styles.root} edges={['top', 'bottom']}>
-          <ModalHeader onClose={handleClose} />
+          <StepHeader step={step} onBack={back} onClose={confirmClose} />
+          <View style={styles.progressTrack}>
+            <Animated.View style={[styles.progressFill, {
+              width: progressAnim.interpolate({ inputRange: [0, 1], outputRange: ['0%', '100%'] }),
+            }]} />
+          </View>
           <ScrollView ref={scrollRef} style={styles.scroll} contentContainerStyle={styles.scrollContent}
             keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}
             onScrollBeginDrag={() => Keyboard.dismiss()}>
 
-            <SectionWrap title="Game Setup" summary={summaryGameSetup(draft)} isDone={step > 1} onEdit={() => editSection(1)}>
-              {step === 1 && <StepGameSetup draft={draft} set={set} onNext={next} />}
-            </SectionWrap>
+            <AppearingSection>
+              <SectionWrap title="Game Type" summary={draft.gameType === 'cash' ? 'Cash Game' : draft.gameType === 'tournament' ? 'Tournament' : ''} isDone={step > 1} noAccent={step === 1}>
+                {step === 1 && <StepGameType draft={draft} set={set} onNext={next} />}
+              </SectionWrap>
+            </AppearingSection>
 
             {step >= 2 && (
-              <SectionWrap title="Position" summary={summaryPosition(draft)} isDone={step > 2} onEdit={() => editSection(2)}>
-                {step === 2 && <StepPosition draft={draft} set={set} onNext={next} />}
-              </SectionWrap>
+              <AppearingSection>
+                <SectionWrap title="Blinds & Stack" summary={summaryGameSetup(draft)} isDone={step > 2}>
+                  {step === 2 && <StepBlinds draft={draft} set={set} onNext={next} />}
+                </SectionWrap>
+              </AppearingSection>
             )}
 
             {step >= 3 && (
-              <SectionWrap title="Hole Cards" summary={summaryCards(draft)} isDone={step > 3} onEdit={() => editSection(3)}>
-                {step === 3 && <StepCards draft={draft} set={set} onNext={next} onSkip={next} />}
-              </SectionWrap>
+              <AppearingSection>
+                <SectionWrap title="Positions" summary={summaryPosition(draft)} isDone={step > 3}>
+                  {step === 3 && <StepPosition draft={draft} set={set} onNext={next} />}
+                </SectionWrap>
+              </AppearingSection>
             )}
 
             {step >= 4 && (
-              <SectionWrap title="Preflop" summary={summaryPreflop(draft)} isDone={step > 4} onEdit={() => editSection(4)}>
-                {step === 4 && (
-                  <StepPreflop draft={draft} set={set} onNext={next} onFold={skip} onEdit={() => clearAfter('preflop')} />
-                )}
-              </SectionWrap>
+              <AppearingSection>
+                <SectionWrap title="Hole Cards" summary={summaryCards(draft)} isDone={step > 4}>
+                  {step === 4 && <StepCards draft={draft} set={set} onNext={next} onSkip={next} />}
+                </SectionWrap>
+              </AppearingSection>
+            )}
+
+            {step >= 5 && (
+              <AppearingSection>
+                <SectionWrap title="Preflop" summary={summaryPreflop(draft)} isDone={step > 5} divider>
+                  {step === 5 && (
+                    <StepPreflop draft={draft} set={set} onNext={next} onFold={skip} onEdit={() => clearAfter('preflop')}
+                      onSizingOpen={scrollToEndSoon} />
+                  )}
+                </SectionWrap>
+              </AppearingSection>
             )}
 
             {showFlop && (
-              <SectionWrap title="Flop" summary={summaryStreet('flop', draft)} isDone={step > 5} onEdit={() => editSection(5)}>
-                {step === 5 && (
-                  <StepStreet street="flop" phase={flopPhase} onPhaseChange={setFlopPhase}
-                    draft={draft} set={set} onNext={next} onFold={skip} onEdit={() => clearAfter('flop')} />
-                )}
-              </SectionWrap>
+              <AppearingSection>
+                <SectionWrap title="Flop" summary={summaryStreet('flop', draft)} isDone={step > 6} divider>
+                  {step === 6 && (
+                    <StepStreet street="flop" phase={flopPhase} onPhaseChange={(p) => { animateAccordion(); setFlopPhase(p); }}
+                      draft={draft} set={set} onNext={next} onFold={skip} onEdit={() => clearAfter('flop')}
+                      onSizingOpen={scrollToEndSoon} />
+                  )}
+                </SectionWrap>
+              </AppearingSection>
             )}
 
             {showTurn && (
-              <SectionWrap title="Turn" summary={summaryStreet('turn', draft)} isDone={step > 6} onEdit={() => editSection(6)}>
-                {step === 6 && (
-                  <StepStreet street="turn" phase={turnPhase} onPhaseChange={setTurnPhase}
-                    draft={draft} set={set} onNext={next} onFold={skip} onEdit={() => clearAfter('turn')} />
-                )}
-              </SectionWrap>
+              <AppearingSection>
+                <SectionWrap title="Turn" summary={summaryStreet('turn', draft)} isDone={step > 7} divider>
+                  {step === 7 && (
+                    <StepStreet street="turn" phase={turnPhase} onPhaseChange={(p) => { animateAccordion(); setTurnPhase(p); }}
+                      draft={draft} set={set} onNext={next} onFold={skip} onEdit={() => clearAfter('turn')}
+                      onSizingOpen={scrollToEndSoon} />
+                  )}
+                </SectionWrap>
+              </AppearingSection>
             )}
 
             {showRiver && (
-              <SectionWrap title="River" summary={summaryStreet('river', draft)} isDone={step > 7} onEdit={() => editSection(7)}>
-                {step === 7 && (
-                  <StepStreet street="river" phase={riverPhase} onPhaseChange={setRiverPhase}
-                    draft={draft} set={set} onNext={next} onFold={skip} onEdit={() => clearAfter('river')} />
-                )}
-              </SectionWrap>
-            )}
-
-            {step >= 8 && (
-              <SectionWrap title="Result" summary={summaryResult(draft)} isDone={step > 8} onEdit={() => editSection(8)}>
-                {step === 8 && <StepResult draft={draft} set={set} onNext={next} />}
-              </SectionWrap>
+              <AppearingSection>
+                <SectionWrap title="River" summary={summaryStreet('river', draft)} isDone={step > 8} divider>
+                  {step === 8 && (
+                    <StepStreet street="river" phase={riverPhase} onPhaseChange={(p) => { animateAccordion(); setRiverPhase(p); }}
+                      draft={draft} set={set} onNext={next} onFold={skip} onEdit={() => clearAfter('river')}
+                      onSizingOpen={scrollToEndSoon} />
+                  )}
+                </SectionWrap>
+              </AppearingSection>
             )}
 
             {step >= 9 && (
-              <View style={styles.sectionActive}>
-                <Text style={styles.sectionActiveTitle}>Tag &amp; Save</Text>
-                <StepNameTag draft={draft} set={set} onNext={next} onSave={handleSave} />
-              </View>
+              <AppearingSection>
+                <SectionWrap title="Result" summary={summaryResult(draft)} isDone={step > 9}>
+                  {step === 9 && <StepResult draft={draft} set={set} onNext={next} />}
+                </SectionWrap>
+              </AppearingSection>
+            )}
+
+            {step >= 10 && (
+              <AppearingSection>
+                <View>
+                  <Text style={styles.sectionLabel}>Tag &amp; Save</Text>
+                  <View style={[styles.sectionCard, styles.sectionCardActive]}>
+                    <StepNameTag draft={draft} set={set} onNext={next} onSave={handleSave}
+                      onFocusScroll={scrollToEndSoon} />
+                  </View>
+                </View>
+              </AppearingSection>
             )}
           </ScrollView>
         </SafeAreaView>
@@ -2067,32 +2254,57 @@ const styles = StyleSheet.create({
   header:      { paddingHorizontal: Spacing.four, paddingTop: Spacing.two, paddingBottom: Spacing.two, borderBottomWidth: 1, borderBottomColor: C.backgroundElement },
   headerRow:   { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   headerTitle: { fontSize: 17, fontWeight: '800', color: C.text },
-  headerActions: { flexDirection: 'row', alignItems: 'center', gap: 12, minWidth: 56, justifyContent: 'flex-end' },
-  headerDoneText: { fontSize: 14, fontWeight: '600', color: C.tint },
-  closeBtn:    { alignItems: 'flex-end' },
+  headerSide:  { minWidth: 60, justifyContent: 'center' },
+  headerSideRight: { alignItems: 'flex-end' },
+  backBtn:     { flexDirection: 'row', alignItems: 'center', minHeight: 44, paddingRight: 8 },
+  backIcon:    { fontSize: 24, color: C.tint, fontWeight: '300', lineHeight: 26 },
+  backLabel:   { fontSize: 15, color: C.tint, fontWeight: '500' },
+  // Touch target padded out to the 44x44 minimum without growing the icon
+  // itself — the icon's fontSize is untouched, only the surrounding
+  // Pressable box is bigger.
+  closeBtn:    { minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center', padding: 12 },
   closeIcon:   { fontSize: 15, color: C.textSecondary, fontWeight: '600' },
 
   scroll:        { flex: 1 },
-  scrollContent: { paddingHorizontal: Spacing.four, paddingTop: Spacing.three, paddingBottom: 60, gap: 10 },
+  scrollContent: { paddingHorizontal: Spacing.four, paddingTop: Spacing.three, paddingBottom: 60, gap: 8 },
 
-  // Accordion section shell — a done section collapses to one tappable
-  // summary row; the active section gets a titled, fully expanded body.
+  progressTrack: { height: 3, marginHorizontal: Spacing.four, marginTop: Spacing.two, backgroundColor: C.backgroundElement, borderRadius: 2, overflow: 'hidden' },
+  progressFill:  { height: '100%', backgroundColor: HERO_COLOR, borderRadius: 2 },
+
+  // Accordion section shell — a persistent small-caps label sits above
+  // every card. A done card collapses to one tappable summary row with a
+  // checkmark + edit pencil; the active card gets a green left-border
+  // accent and shows the section's fully expanded, live-editable body.
+  // The accent itself is an absolutely-positioned bar (see sectionAccentBar)
+  // rather than a real border, so its opacity can animate independently —
+  // paddingLeft reserves its width permanently so nothing shifts.
   sectionBody:   { gap: 14 },
-  sectionDone:   { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: C.backgroundElement, borderRadius: 14, paddingVertical: 12, paddingHorizontal: 16 },
-  sectionDoneTitle:   { fontSize: 10, fontWeight: '700', color: C.textSecondary, textTransform: 'uppercase', letterSpacing: 0.7 },
-  sectionDoneSummary: { fontSize: 14, fontWeight: '600', color: C.text, marginTop: 2 },
-  sectionEditIcon:    { fontSize: 16, color: C.tint },
-  sectionActive:      { gap: 14, borderRadius: 16, borderWidth: 1.5, borderColor: C.backgroundElement, padding: 14 },
-  sectionActiveTitle: { fontSize: 13, fontWeight: '800', color: C.tint, textTransform: 'uppercase', letterSpacing: 0.7 },
+  sectionLabel:  { fontSize: 11, fontWeight: '700', color: C.textSecondary, textTransform: 'uppercase', letterSpacing: 0.7, marginBottom: 6, marginLeft: 2 },
+  // Bolder "crossing a boundary" treatment for preflop/flop/turn/river.
+  streetDividerRow:   { flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 4, marginBottom: 8 },
+  streetDividerLine:  { flex: 1, height: 1, backgroundColor: C.backgroundSelected },
+  streetDividerLabel: { fontSize: 13, fontWeight: '800', color: HERO_COLOR, textTransform: 'uppercase', letterSpacing: 1.4 },
+  sectionCard:   { backgroundColor: C.backgroundElement, borderRadius: 10, paddingVertical: 14, paddingRight: 14, paddingLeft: 17, position: 'relative', overflow: 'hidden' },
+  sectionCardActive: { gap: 14 },
+  sectionCardDone:   { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  // No accent bar reserved — symmetric padding, plain card.
+  sectionCardPlain:  { paddingLeft: 14 },
+  sectionAccentBar:  { position: 'absolute', left: 0, top: 0, bottom: 0, width: 3, backgroundColor: HERO_COLOR },
+  sectionGreyBar:    { position: 'absolute', left: 0, top: 0, bottom: 0, width: 3, backgroundColor: C.backgroundSelected },
+  sectionDoneSummary: { fontSize: 14, fontWeight: '600', color: C.text },
+  sectionCheckmark:   { fontSize: 15, fontWeight: '700', color: HERO_COLOR },
 
   label:     { fontSize: 11, fontWeight: '700', color: C.textSecondary, textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: -4 },
   fieldLabel:{ fontSize: 12, fontWeight: '600', color: C.textSecondary },
 
+  // Every selectable option is a clearly outlined box — filled green with
+  // cream text when chosen, cream with a dark outline and dark text
+  // otherwise. Nothing selectable should read as plain text.
   chipRow:       { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  chip:          { paddingHorizontal: 16, minHeight: 44, justifyContent: 'center', borderRadius: 12, backgroundColor: C.backgroundElement },
-  chipActive:    { backgroundColor: C.tint },
+  chip:          { paddingHorizontal: 16, minHeight: 44, justifyContent: 'center', borderRadius: 12, backgroundColor: C.backgroundElement, borderWidth: 1.5, borderColor: C.text },
+  chipActive:    { backgroundColor: HERO_COLOR, borderColor: HERO_COLOR },
   chipText:      { fontSize: 14, fontWeight: '700', color: C.text },
-  chipTextActive:{ color: '#fff' },
+  chipTextActive:{ color: C.background },
 
   twoCol: { flexDirection: 'row', gap: 10 },
 
@@ -2100,10 +2312,10 @@ const styles = StyleSheet.create({
   numInput: { flex: 1, fontSize: 20, fontWeight: '700', color: C.text, paddingVertical: 12, textAlign: 'center' },
   stackNote:{ fontSize: 12, color: C.textSecondary, textAlign: 'center', marginTop: -6 },
 
-  unitToggle:       { flexDirection: 'column', borderLeftWidth: 1, borderLeftColor: C.backgroundSelected },
-  unitBtn:          { paddingHorizontal: 10, paddingVertical: 7, alignItems: 'center', backgroundColor: C.backgroundElement },
-  unitBtnText:      { fontSize: 11, fontWeight: '700', color: C.textSecondary },
-  unitBtnTextActive:{ color: '#fff' },
+  unitToggle:       { flexDirection: 'column', borderWidth: 1.5, borderColor: C.text, borderRadius: 8, overflow: 'hidden' },
+  unitBtn:          { paddingHorizontal: 10, paddingVertical: 7, alignItems: 'center', backgroundColor: C.backgroundElement, minWidth: 44 },
+  unitBtnText:      { fontSize: 11, fontWeight: '700', color: C.text },
+  unitBtnTextActive:{ color: C.background },
 
   nextBtn:        { backgroundColor: C.tint, borderRadius: 14, paddingVertical: 16, alignItems: 'center' },
   nextBtnOff:     { backgroundColor: C.backgroundElement },
@@ -2112,11 +2324,10 @@ const styles = StyleSheet.create({
   skipBtn:        { alignItems: 'center', justifyContent: 'center', minHeight: 44, paddingVertical: 8 },
   skipBtnText:    { fontSize: 13, color: C.textSecondary, textDecorationLine: 'underline' },
 
-  gameBtn:         { flex: 1, maxHeight: 220, alignItems: 'center', justifyContent: 'center', gap: 10, borderWidth: 2, borderColor: C.backgroundElement, borderRadius: 20 },
-  gameHalfIcon:    { width: 64, height: 64, borderRadius: 20, alignItems: 'center', justifyContent: 'center', marginBottom: 4 },
-  gameHalfIconText:{ fontSize: 30, fontWeight: '900' },
-  gameHalfTitle:   { fontSize: 24, fontWeight: '800', color: C.text },
-  gameHalfDesc:    { fontSize: 14, color: C.textSecondary, textAlign: 'center' },
+  // Full-screen game type picker — two big bordered buttons, clean text only.
+  gameTypeScreen:  { gap: 12 },
+  gameTypeBtn:     { flex: 1, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: C.text, borderRadius: 20, backgroundColor: C.backgroundElement },
+  gameTypeBtnText: { fontSize: 26, fontWeight: '800', color: C.text },
 
   selectorBtn:  { flexDirection: 'row', alignItems: 'center', backgroundColor: C.backgroundElement, borderRadius: 14, padding: 14, gap: 12, borderWidth: 2, borderColor: 'transparent' },
   selectorDot:  { width: 12, height: 12, borderRadius: 6, flexShrink: 0 },
@@ -2168,10 +2379,13 @@ const styles = StyleSheet.create({
   actionInputHeader: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   actionInputTitle:  { fontSize: 12, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.6 },
   actionBtnsRow:     { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  actionBtn:         { paddingHorizontal: 12, paddingVertical: 12, minHeight: 48, justifyContent: 'center', borderRadius: 10, minWidth: '44%', flexGrow: 1, alignItems: 'center', backgroundColor: C.backgroundElement },
+  // Each action gets a clear outlined box (colored per its semantic meaning
+  // in ACTION_COLORS), not just a filled chip — the border stays visible
+  // even when not pressed or pre-selected.
+  actionBtn:         { paddingHorizontal: 12, paddingVertical: 12, minHeight: 48, justifyContent: 'center', borderRadius: 10, minWidth: '44%', flexGrow: 1, alignItems: 'center', backgroundColor: C.backgroundElement, borderWidth: 1.5, borderColor: C.backgroundSelected },
   actionBtnText:     { fontSize: 14, fontWeight: '700', color: C.text },
 
-  sizeChip:    { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10, backgroundColor: C.backgroundElement, alignItems: 'center', minWidth: 70, gap: 1 },
+  sizeChip:    { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10, backgroundColor: C.backgroundElement, alignItems: 'center', minWidth: 70, gap: 1, borderWidth: 1.5, borderColor: C.backgroundSelected },
   sizeChipLabel:{ fontSize: 12, fontWeight: '700', color: C.text },
   sizeChipAmt: { fontSize: 10, fontWeight: '600', color: C.textSecondary },
 
@@ -2181,6 +2395,7 @@ const styles = StyleSheet.create({
   confirmBtn:     { borderRadius: 12, paddingVertical: 14, alignItems: 'center' },
   confirmBtnText: { fontSize: 15, fontWeight: '700', color: '#fff' },
 
+
   potBadge:     { backgroundColor: C.backgroundElement, borderRadius: 10, paddingHorizontal: 14, paddingVertical: 10, alignSelf: 'flex-start' },
   potBadgeText: { fontSize: 14, fontWeight: '700', color: C.tint },
 
@@ -2189,8 +2404,6 @@ const styles = StyleSheet.create({
   outcomeSub:    { fontSize: 14, color: C.textSecondary, fontWeight: '500' },
   showdownBtn:     { borderWidth: 1.5, borderColor: C.backgroundSelected, borderRadius: 14, padding: 16, alignItems: 'center' },
   showdownBtnText: { fontSize: 15, fontWeight: '700', color: C.text },
-  streetHeader:    { fontSize: 10, fontWeight: '700', color: C.textSecondary, textTransform: 'uppercase', letterSpacing: 0.9, marginTop: 8, marginBottom: 2 },
-  emptyStreet:     { fontSize: 12, color: C.textSecondary, fontStyle: 'italic', paddingLeft: 4 },
   shareBtn:        { borderWidth: 1.5, borderColor: C.tint, borderRadius: 12, paddingVertical: 13, alignItems: 'center' },
   shareBtnText:    { fontSize: 14, fontWeight: '700', color: C.tint },
 
@@ -2202,11 +2415,6 @@ const styles = StyleSheet.create({
 
   nameInput:      { backgroundColor: C.backgroundElement, borderRadius: 12, paddingHorizontal: 16, paddingVertical: 14, fontSize: 16, fontWeight: '600', color: C.text },
   nameHint:       { fontSize: 11, color: C.textSecondary, marginTop: -6 },
-  tagGrid:        { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  tagBtn:         { flex: 1, minWidth: '44%', paddingVertical: 14, borderRadius: 14, backgroundColor: C.backgroundElement, alignItems: 'center' },
-  tagBtnActive:   { backgroundColor: C.tint },
-  tagLabel:       { fontSize: 13, fontWeight: '600', color: C.text },
-  tagLabelActive: { color: C.tintText },
   notesInput:     { backgroundColor: C.backgroundElement, borderRadius: 12, paddingHorizontal: 16, paddingVertical: 14, fontSize: 15, color: C.text, minHeight: 80, textAlignVertical: 'top' },
   doneLinkWrap:   { alignSelf: 'flex-end', paddingVertical: 6, paddingHorizontal: 2 },
   doneLinkText:   { fontSize: 13, fontWeight: '600', color: C.tint },

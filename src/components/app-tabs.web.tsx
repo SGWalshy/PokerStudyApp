@@ -1,3 +1,4 @@
+import { Href } from 'expo-router';
 import {
   Tabs,
   TabList,
@@ -19,17 +20,21 @@ export default function AppTabs() {
       <TabSlot style={{ height: '100%' }} />
       <TabList asChild>
         <CustomTabList>
-          <TabTrigger name="home" href="/" asChild>
-            <TabButton>Home</TabButton>
-          </TabTrigger>
           <TabTrigger name="hands" href="/hands" asChild>
             <TabButton>Hands</TabButton>
           </TabTrigger>
-          <TabTrigger name="bankroll" href="/bankroll" asChild>
-            <TabButton>Bankroll</TabButton>
-          </TabTrigger>
           <TabTrigger name="goals" href="/goals" asChild>
             <TabButton>Goals</TabButton>
+          </TabTrigger>
+          {/* "/(tabs)" is the correct runtime href for the group's own index
+              route (verified working), but expo-router's typed-routes
+              generator doesn't include this exact literal in its union for
+              this route shape — cast rather than fight the generator. */}
+          <TabTrigger name="index" href={'/(tabs)' as Href} asChild>
+            <TabButton>Home</TabButton>
+          </TabTrigger>
+          <TabTrigger name="bankroll" href="/bankroll" asChild>
+            <TabButton>Bankroll</TabButton>
           </TabTrigger>
           <TabTrigger name="groups" href="/groups" asChild>
             <TabButton>Groups</TabButton>

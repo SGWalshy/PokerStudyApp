@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { useEffect, useRef, useState } from 'react';
+import { Animated, Easing, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { Colors } from '@/constants/theme';
 import { CardType, Rank, Suit, SUITS, SUIT_COLORS } from './types';
@@ -67,6 +67,9 @@ export function CardPicker({
   onPendingChange,
 }: CardPickerProps) {
   const [pendingRank, setPendingRankRaw] = useState<Rank | null>(null);
+  // One opacity per suit, faded independently — a suit whose card is
+  // already used stays dim even while its siblings fade in.
+  const suitOpacities = useRef(SUITS.map(() => new Animated.Value(0.35))).current;
 
   const setPendingRank = (r: Rank | null) => {
     setPendingRankRaw(r);
@@ -83,6 +86,22 @@ export function CardPicker({
   const handleRank = (rank: Rank) => {
     setPendingRank(rank === pendingRank ? null : rank);
   };
+
+  // Subtle fade — not a bounce or slide — each suit brightens on its own as
+  // soon as a rank makes it a valid pick, and dims back out otherwise.
+  useEffect(() => {
+    SUITS.forEach((s, i) => {
+      const enabled = !!pendingRank && !isCardUsed(pendingRank, s);
+      Animated.timing(suitOpacities[i], {
+        toValue: enabled ? 1 : 0.35,
+        duration: 180,
+        easing: Easing.out(Easing.ease),
+        useNativeDriver: true,
+      }).start();
+    });
+    // usedCards is effectively static during a single picking session
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingRank]);
 
   const handleSuit = (suit: Suit) => {
     if (!pendingRank) return;
@@ -148,25 +167,28 @@ export function CardPicker({
       {renderRankRow(RANKS_ROW1)}
       {renderRankRow(RANKS_ROW2)}
 
-      {/* Suit row — sits below the ranks at all times; simply brightens once
-          a rank is pending, with no size change or bounce. */}
-      <View style={[styles.suitRow, pendingRank && styles.suitRowActive]}>
-        {SUITS.map((s) => {
+      {/* Suit row — sits below the ranks at all times; each button fades in
+          on its own once it becomes a valid pick for the pending rank. */}
+      <View style={styles.suitRow}>
+        {SUITS.map((s, i) => {
           const disabled = !pendingRank || isCardUsed(pendingRank, s);
           return (
-            <Pressable
-              key={s}
-              onPress={() => handleSuit(s)}
-              disabled={disabled}
-              style={[styles.suitBtn, !!pendingRank && styles.suitBtnActive, disabled && styles.suitBtnOff]}>
-              <Text style={[
-                styles.suitText,
-                { color: SUIT_COLORS[s] },
-                disabled && styles.suitTextOff,
-              ]}>
-                {s}
-              </Text>
-            </Pressable>
+            <Animated.View key={s} style={[styles.suitBtnWrap, { opacity: suitOpacities[i] }]}>
+              <Pressable
+                onPress={() => handleSuit(s)}
+                disabled={disabled}
+                style={({ pressed }) => [styles.suitBtn, pressed && !disabled && styles.suitBtnPressed]}>
+                {({ pressed }) => (
+                  <Text style={[
+                    styles.suitText,
+                    { color: SUIT_COLORS[s] },
+                    pressed && !disabled && styles.suitTextPressed,
+                  ]}>
+                    {s}
+                  </Text>
+                )}
+              </Pressable>
+            </Animated.View>
           );
         })}
       </View>
@@ -201,15 +223,15 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 2,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.12,
-    shadowRadius: 3,
-    elevation: 2,
+    borderWidth: 1.5,
+    borderColor: C.backgroundSelected,
   },
   cardRank: { fontWeight: '800' },
   cardSuit: { fontWeight: '600' },
 
+  // Every rank/suit button is a clearly outlined box, same language as the
+  // rest of the app — cream + dark outline unselected, filled green + cream
+  // text selected. No shadows or glows.
   rankRow: { flexDirection: 'row', justifyContent: 'center', gap: 7 },
   rankBtn: {
     minWidth: 44,
@@ -218,36 +240,35 @@ const styles = StyleSheet.create({
     backgroundColor: C.backgroundElement,
     alignItems: 'center',
     justifyContent: 'center',
+    borderWidth: 1.5,
+    borderColor: C.text,
   },
   rankBtnOn: {
     backgroundColor: C.tint,
+    borderColor: C.tint,
   },
-  rankBtnDisabled: { backgroundColor: C.backgroundSelected, opacity: 0.4 },
+  rankBtnDisabled: { backgroundColor: C.backgroundSelected, borderColor: C.backgroundSelected, opacity: 0.5 },
   rankText: { fontSize: 17, fontWeight: '700', color: C.text },
-  rankTextOn: { color: C.tintText },
+  rankTextOn: { color: C.background },
   rankTextDisabled: { color: C.textSecondary },
 
   suitRow: { flexDirection: 'row', justifyContent: 'center', gap: 10 },
+  suitBtnWrap: { flex: 1, maxWidth: 76 },
   suitBtn: {
-    flex: 1,
     height: 56,
     borderRadius: 14,
     backgroundColor: C.backgroundElement,
     alignItems: 'center',
     justifyContent: 'center',
-    maxWidth: 76,
-    borderWidth: 2,
-    borderColor: 'transparent',
+    borderWidth: 1.5,
+    borderColor: C.text,
   },
-  suitRowActive: {},
-  suitBtnActive: {
-    backgroundColor: '#FFFFFF',
+  suitBtnPressed: {
+    backgroundColor: C.tint,
     borderColor: C.tint,
-    opacity: 1,
   },
-  suitBtnOff: { opacity: 0.3 },
-  suitText: { fontSize: 26, fontWeight: '600' },
-  suitTextOff: {},
+  suitText: { fontSize: 26, fontWeight: '700' },
+  suitTextPressed: { color: C.background },
 
   instructions: { textAlign: 'center', fontSize: 13, color: C.textSecondary },
   instructionsActive: { color: C.tint, fontWeight: '700' },
