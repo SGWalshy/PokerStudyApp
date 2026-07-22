@@ -1604,65 +1604,227 @@ function StepStreet({ street, phase, onPhaseChange, draft, set, onNext, onFold, 
 
 // ── Hand history ──────────────────────────────────────────────────────────────
 
+// Standard hand-history notation (Ah, 7c, 2d) rather than the app's own
+// suit glyphs — the export is meant to read like a normal hand history.
+const SUIT_LETTER: Record<string, string> = { '♠': 's', '♥': 'h', '♦': 'd', '♣': 'c' };
+function cardStr(c: CardType): string { return `${c.rank}${SUIT_LETTER[c.suit]}`; }
+
 function buildHistory(draft: HandDraft): string {
   const labels  = POSITION_LABELS[draft.playerCount] ?? [];
   const heroPos = draft.heroSeat !== null ? (labels[draft.heroSeat] ?? '?') : '?';
+  const namedVillains = draft.villainSeats.map((_, i) => `villain${i + 1}`);
+
+  const posFor = (a: string) => {
+    if (a === 'hero') return heroPos;
+    if (a.startsWith('villain')) { const vi = parseInt(a.replace('villain', ''), 10) - 1; return labels[draft.villainSeats[vi]] ?? '?'; }
+    if (a.startsWith('seat_')) { const si = parseInt(a.replace('seat_', ''), 10); return labels[si] ?? '?'; }
+    return '?';
+  };
+  // Always "Villain N" (never a bare "Villain"), so the player list and the
+  // action lines below it always refer to the same name. An unnamed seat
+  // (only possible in a side pot's eligible list, never in the action lines
+  // themselves) falls back to its table position rather than "Villain NaN".
   const nameFor = (a: string) => {
-    if (a === 'hero') return `Hero(${heroPos})`;
-    if (a.startsWith('villain')) { const vi=parseInt(a.replace('villain',''),10)-1; return `V${vi+1}(${labels[draft.villainSeats[vi]]??'?'})`; }
-    return labels[parseInt(a.replace('seat_',''),10)] ?? a;
+    if (a === 'hero') return 'Hero';
+    if (a.startsWith('villain')) return `Villain ${parseInt(a.replace('villain', ''), 10)}`;
+    return posFor(a);
   };
-  const fmtA = (a: ActionEntry) => {
-    const n = nameFor(a.actor);
-    switch (a.action) {
-      case 'fold':  return `${n}: fold`;
-      case 'check': return `${n}: check`;
-      case 'call':  return `${n}: call ${fmtSize(a.sizingBB)}BB`;
-      case 'bet':   return `${n}: bet ${fmtSize(a.sizingBB)}BB`;
-      case 'raise': return `${n}: raise to ${fmtSize(a.sizingBB)}BB`;
-      case 'allin': return `${n}: all-in ${fmtSize(a.sizingBB)}BB`;
-      default:      return `${n}: ${a.action}`;
+
+  // ── Units: BB throughout, unless this hand was actually tracked in chips —
+  // never mix the two in one export. ─────────────────────────────────────────
+  const useChips = draft.stackUnit === 'Chips' && draft.bigBlind > 0;
+  const fmtAmt = (bb: number) => useChips ? `${fmtSize(bb * draft.bigBlind)} chips` : `${fmtSize(bb)}BB`;
+
+  // ── Starting stacks — a villain's is only "known" if it was actually typed
+  // in; otherwise it's assumed equal to Hero's for math, but never presented
+  // as a precise all-in figure (see fmtA's 'allin' case below). ─────────────
+  const heroStackBB = draft.effectiveStackBB || draft.effectiveStack;
+  const stackKnown = (a: string) => a === 'hero' ? heroStackBB > 0 : !!(draft.villainStacksBB[a] && draft.villainStacksBB[a] > 0);
+  const stackFor   = (a: string) => a === 'hero' ? heroStackBB : (stackKnown(a) ? draft.villainStacksBB[a] : heroStackBB);
+
+  // A call/bet/raise that happens to exhaust the actor's whole stack is just
+  // as much an all-in as tapping the dedicated All-In button (e.g. "Call
+  // All-In" is stored as a plain 'call' action) — detect it from the running
+  // total invested rather than only trusting the action's own type, so the
+  // "don't show a fabricated number for an unknown stack" rule applies no
+  // matter which control produced the action.
+  const fmtA = (e: ActionEntry, priorTotal: Record<string, number>) => {
+    const n = nameFor(e.actor);
+    if (e.action === 'fold')  return `${n} folds`;
+    if (e.action === 'check') return `${n} checks`;
+
+    const stack = stackFor(e.actor);
+    const totalAfter = (priorTotal[e.actor] ?? 0) + e.sizingBB;
+    const isAllIn = e.action === 'allin' || (stack > 0 && totalAfter >= stack - 0.01);
+    if (isAllIn) return stackKnown(e.actor) ? `${n} is all in for ${fmtAmt(e.sizingBB)}` : `${n} is all in`;
+
+    switch (e.action) {
+      case 'call':  return `${n} calls ${fmtAmt(e.sizingBB)}`;
+      case 'bet':   return `${n} bets ${fmtAmt(e.sizingBB)}`;
+      case 'raise': return `${n} raises to ${fmtAmt(e.sizingBB)}`;
+      default:      return `${n} ${e.action}`;
     }
   };
-  const c1 = draft.card1 ? `${draft.card1.rank}${draft.card1.suit}` : '?';
-  const c2 = draft.card2 ? `${draft.card2.rank}${draft.card2.suit}` : '?';
-  const gameStr = draft.gameType === 'cash' ? `$${draft.smallBlind}/$${draft.bigBlind} NL Hold'em` : `${draft.smallBlind}/${draft.bigBlind} (Tournament)`;
-  const lines = [
-    `${gameStr} · ${draft.playerCount}-max · ${Math.round(draft.effectiveStackBB || draft.effectiveStack)}BB eff`,
-    `Hero(${heroPos}): ${c1} ${c2}`, '',
-    '── Preflop ─────────────────────',
-    ...draft.preflopActions.map(a => '  ' + fmtA(a)),
-    `  Pot: ${fmtSize(draft.preflopPotBB)}BB (${draft.potType})`,
-  ];
-  const basePot = draft.preflopPotBB > 0 ? draft.preflopPotBB : 1.5;
+  const namedOnly = (acts: ActionEntry[]) => acts.filter(e => e.actor === 'hero' || e.actor.startsWith('villain'));
+  const streetLine = (acts: ActionEntry[], priorTotal: Record<string, number>) =>
+    namedOnly(acts).map(e => fmtA(e, priorTotal)).join(', ');
+
+  // ── Pot math — each street's state is threaded from the previous street's
+  // ending pot, so every number here is the running total of every bet and
+  // call from every player across the whole hand, not just this street. ────
+  const sbBB    = draft.bigBlind > 0 ? draft.smallBlind / draft.bigBlind : 0.5;
+  const stradBB = draft.straddleEnabled && draft.bigBlind > 0 ? draft.straddleAmount / draft.bigBlind : 0;
+  const actorOrder = getFullPreflopActorOrder(draft.playerCount, draft.heroSeat, draft.villainSeats);
+  const initInv     = buildPreflopInvestments(actorOrder, sbBB, stradBB, draft.playerCount);
+  const pf = computePreflopState(draft.preflopActions, sbBB, stradBB, initInv);
+
+  // Ante is dead money that enters the pot before any preflop action, so it
+  // has to be added on top of what computePreflopState tracks (which only
+  // knows about blinds/straddle + player actions). "BB Ante" is one full BB
+  // posted once for the whole table; a flat "Ante" is posted per seat.
+  const anteTotalBB = draft.bigBlind > 0
+    ? draft.anteType === 'bbAnte' ? draft.anteAmount / draft.bigBlind
+      : draft.anteType === 'ante' ? (draft.anteAmount * draft.playerCount) / draft.bigBlind
+      : 0
+    : 0;
+  const pfPotBB = pf.potBB + anteTotalBB;
+
+  const flop  = computeStreetState(draft.flopActions, pfPotBB);
+  const turn  = computeStreetState(draft.turnActions, flop.potBB);
+  const river = computeStreetState(draft.riverActions, turn.potBB);
+
+  // Per-street "already invested before this street" totals, so an all-in
+  // check on the turn (say) accounts for chips already committed preflop
+  // and on the flop, not just what moved on the current street.
+  const combine = (...maps: Record<string, number>[]) => {
+    const out: Record<string, number> = {};
+    for (const m of maps) for (const k in m) out[k] = (out[k] ?? 0) + m[k];
+    return out;
+  };
+  const priorFlop  = combine(pf.investedBB);
+  const priorTurn  = combine(pf.investedBB, flop.investedBB);
+  const priorRiver = combine(pf.investedBB, flop.investedBB, turn.investedBB);
+
+  const finalPotBB = draft.riverCard ? river.potBB
+    : draft.turnCard ? turn.potBB
+    : draft.flopCards.some(Boolean) ? flop.potBB
+    : pfPotBB;
+
+  // ── Header ──────────────────────────────────────────────────────────────
+  const anteLabel = draft.anteType === 'bbAnte' ? 'BB Ante' : draft.anteType === 'ante' ? 'Ante' : '';
+  const stakesLine = draft.gameType === 'cash'
+    ? `Stakes: $${fmtSize(draft.cashSB)}/$${fmtSize(draft.cashBB)}${draft.straddleEnabled ? ' · Straddle' : ''}`
+    : `Stakes: ${fmtSize(draft.tournamentSB)}/${fmtSize(draft.tournamentBB)}${anteLabel ? ' ' + anteLabel : ''}`;
+
+  const c1 = draft.card1 ? cardStr(draft.card1) : null;
+  const c2 = draft.card2 ? cardStr(draft.card2) : null;
+
+  const lines = [stakesLine];
+  lines.push(`Hero: ${heroPos} (${fmtAmt(heroStackBB)})${c1 && c2 ? ` [${c1} ${c2}]` : ''}`);
+  namedVillains.forEach(v => {
+    // A villain stack that was never entered is a guess, not a fact — leave
+    // it off the player list rather than presenting Hero's stack as theirs.
+    lines.push(`${nameFor(v)}: ${posFor(v)}${stackKnown(v) ? ` (${fmtAmt(stackFor(v))})` : ''}`);
+  });
+  lines.push('');
+
+  // ── Streets — preflop has no pot prefix (nothing's been bet before it);
+  // every street after shows the running pot in parens next to its name. ──
+  const preflopStr = streetLine(draft.preflopActions, {});
+  lines.push(`Preflop:${preflopStr ? ' ' + preflopStr : ' (no action recorded)'}`);
+
+  const pushStreet = (label: string, board: string, potBB: number, acts: ActionEntry[], priorTotal: Record<string, number>) => {
+    const actsStr = streetLine(acts, priorTotal);
+    lines.push(`${label} (${fmtAmt(potBB)}): ${board}${actsStr ? ' — ' + actsStr : ''}`);
+  };
+  // Each street header shows the pot as it stood ENTERING that street (the
+  // standard hand-history convention, e.g. "Flop (6BB): ... Hero bets 4BB"),
+  // not the pot after that street's own action — that ending value belongs
+  // to the START of the next street instead.
   if (draft.flopCards.some(Boolean)) {
-    const fStr = draft.flopCards.filter(Boolean).map(c => `${c!.rank}${c!.suit}`).join(' ');
-    const fEnd = computeStreetState(draft.flopActions, basePot).potBB;
-    lines.push('', `── Flop: ${fStr} ──────────────`, ...draft.flopActions.map(a => '  ' + fmtA(a)));
-    if (draft.flopActions.length) lines.push(`  Pot: ${fmtSize(fEnd)}BB`);
-    if (draft.turnCard) {
-      const tEnd = computeStreetState(draft.turnActions, fEnd).potBB;
-      lines.push('', `── Turn: ${draft.turnCard.rank}${draft.turnCard.suit} ───────────────`, ...draft.turnActions.map(a => '  ' + fmtA(a)));
-      if (draft.turnActions.length) lines.push(`  Pot: ${fmtSize(tEnd)}BB`);
-      if (draft.riverCard) {
-        const rEnd = computeStreetState(draft.riverActions, tEnd).potBB;
-        lines.push('', `── River: ${draft.riverCard.rank}${draft.riverCard.suit} ──────────────`, ...draft.riverActions.map(a => '  ' + fmtA(a)));
-        if (draft.riverActions.length) lines.push(`  Pot: ${fmtSize(rEnd)}BB`);
-      }
-    }
+    pushStreet('Flop', draft.flopCards.filter(Boolean).map(c => cardStr(c!)).join(' '), pfPotBB, draft.flopActions, priorFlop);
   }
-  lines.push('', '── Result ──────────────────────');
-  if (draft.heroFolded) lines.push('  Hero folded — Villain wins');
-  else if (draft.villainMucked) lines.push('  Villain mucked — Hero wins');
-  else {
-    Object.entries(draft.villainHoleCards).forEach(([vKey, [c1, c2]]) => {
-      if (c1 && c2) {
-        const vi = parseInt(vKey.replace('villain',''),10) - 1;
-        lines.push(`  ${nameFor(vKey)} showed: ${c1.rank}${c1.suit} ${c2.rank}${c2.suit}`);
+  if (draft.turnCard) {
+    const board = [...draft.flopCards, draft.turnCard].filter(Boolean).map(c => cardStr(c!)).join(' ');
+    pushStreet('Turn', board, flop.potBB, draft.turnActions, priorTurn);
+  }
+  if (draft.riverCard) {
+    const board = [...draft.flopCards, draft.turnCard, draft.riverCard].filter(Boolean).map(c => cardStr(c!)).join(' ');
+    pushStreet('River', board, turn.potBB, draft.riverActions, priorRiver);
+  }
+  lines.push('');
+
+  // ── Result — side pots (only present when there's a genuine all-in
+  // disparity) are broken out separately rather than folded into one total. ──
+  const totalInvested: Record<string, number> = {};
+  for (const a of actorOrder) {
+    totalInvested[a] = (pf.investedBB[a] ?? 0) + (flop.investedBB[a] ?? 0) + (turn.investedBB[a] ?? 0) + (river.investedBB[a] ?? 0);
+  }
+  const everFolded = new Set([...pf.foldedActors, ...flop.foldedActors, ...turn.foldedActors, ...river.foldedActors]);
+  const everAllIn  = new Set([...pf.allInActors,  ...flop.allInActors,  ...turn.allInActors,  ...river.allInActors]);
+  const sidePots = computeSidePots(actorOrder, totalInvested, everFolded, everAllIn);
+  // Only genuinely multi-player-contested pots count — matches the same
+  // "≥2 eligible" threshold the live SidePotStrip UI uses elsewhere.
+  const contestedPots = sidePots.filter(p => p.eligible.length >= 2);
+
+  const allActs = [...draft.preflopActions, ...draft.flopActions, ...draft.turnActions, ...draft.riverActions];
+  const villainFolded = namedVillains.some(v => allActs.some(a => a.actor === v && a.action === 'fold'));
+  const situation: 'hero_folded' | 'villain_folded' | 'showdown' =
+    draft.heroFolded ? 'hero_folded' : villainFolded ? 'villain_folded' : 'showdown';
+
+  // When the hand ends in a fold, only the pot as it stood BEFORE the final
+  // bet/raise actually changes hands — an uncalled bet was never matched, so
+  // it just returns to whoever put it in rather than being "won."
+  const potBeforeDecisiveFold = (): number => {
+    const streets: { acts: ActionEntry[]; recompute: (a: ActionEntry[]) => number }[] = [
+      { acts: draft.riverActions,   recompute: (a) => computeStreetState(a, turn.potBB).potBB },
+      { acts: draft.turnActions,    recompute: (a) => computeStreetState(a, flop.potBB).potBB },
+      { acts: draft.flopActions,    recompute: (a) => computeStreetState(a, pfPotBB).potBB },
+      { acts: draft.preflopActions, recompute: (a) => computePreflopState(a, sbBB, stradBB, initInv).potBB + anteTotalBB },
+    ];
+    for (const s of streets) {
+      let foldIdx = -1;
+      for (let i = s.acts.length - 1; i >= 0; i--) {
+        const e = s.acts[i];
+        if (e.action === 'fold' && (e.actor === 'hero' || e.actor.startsWith('villain'))) { foldIdx = i; break; }
       }
+      if (foldIdx === -1) continue;
+      const priorAction = s.acts[foldIdx - 1];
+      const cutIdx = priorAction && (priorAction.action === 'bet' || priorAction.action === 'raise' || priorAction.action === 'allin')
+        ? foldIdx - 1 : foldIdx;
+      return s.recompute(s.acts.slice(0, cutIdx));
+    }
+    return finalPotBB;
+  };
+
+  if (situation === 'showdown') {
+    Object.entries(draft.villainHoleCards).forEach(([vKey, [sc1, sc2]]) => {
+      if (sc1 && sc2) lines.push(`${nameFor(vKey)} shows ${cardStr(sc1)} ${cardStr(sc2)}`);
     });
   }
-  if (draft.potSizeBB > 0) lines.push(`  Pot: ${fmtSize(draft.potSizeBB)}BB`);
+
+  if (contestedPots.length >= 2) {
+    contestedPots.forEach((p, i) => {
+      const label = i === 0 ? 'Main pot' : `Side pot ${i}`;
+      const who = p.eligible.map(nameFor).join(', ');
+      lines.push(`${label}: ${fmtAmt(p.amount)} (${who})`);
+    });
+  }
+
+  if (situation === 'hero_folded') {
+    lines.push(`Hero folds. Pot (${fmtAmt(potBeforeDecisiveFold())}) goes to the table.`);
+  } else if (situation === 'villain_folded') {
+    lines.push(`Hero wins ${fmtAmt(potBeforeDecisiveFold())}`);
+  } else if (draft.villainMucked) {
+    lines.push(`Villain mucks. Hero wins ${fmtAmt(finalPotBB)}`);
+  } else if (draft.result === 'won') {
+    lines.push(`Hero wins ${fmtAmt(finalPotBB)}`);
+  } else if (draft.result === 'lost') {
+    lines.push(`Villain wins ${fmtAmt(finalPotBB)}`);
+  } else {
+    lines.push(`Pot: ${fmtAmt(finalPotBB)}`);
+  }
+
   return lines.join('\n');
 }
 
@@ -1960,10 +2122,6 @@ interface SectionWrapProps {
   // Preflop/Flop/Turn/River use the bolder divider treatment (StreetDivider)
   // instead of the plain small-caps label every other section gets.
   divider?: boolean;
-  // Skips the colored left accent bar (and its padding reservation) —
-  // used for the full-screen Game Type picker, which should be plain
-  // outlined boxes with no side decoration at all.
-  noAccent?: boolean;
   children: ReactNode;
 }
 
@@ -1975,7 +2133,7 @@ interface SectionWrapProps {
 // recap card. The accent is a separate absolutely-positioned bar (not a
 // real border) so it can fade in/out on its own — the card reserves its
 // width permanently via paddingLeft so nothing shifts.
-function SectionWrap({ title, summary, isDone, divider, noAccent, children }: SectionWrapProps) {
+function SectionWrap({ title, summary, isDone, divider, children }: SectionWrapProps) {
   const accentOpacity = useRef(new Animated.Value(isDone ? 0 : 1)).current;
   const mountedRef = useRef(false);
 
@@ -1992,9 +2150,9 @@ function SectionWrap({ title, summary, isDone, divider, noAccent, children }: Se
   return (
     <View>
       {divider ? <StreetDivider label={title} /> : <Text style={styles.sectionLabel}>{title}</Text>}
-      <View style={[styles.sectionCard, noAccent && styles.sectionCardPlain, isDone ? styles.sectionCardDone : styles.sectionCardActive]}>
-        {!noAccent && isDone && <View style={styles.sectionGreyBar} />}
-        {!noAccent && <Animated.View pointerEvents="none" style={[styles.sectionAccentBar, { opacity: accentOpacity }]} />}
+      <View style={[styles.sectionCard, isDone ? styles.sectionCardDone : styles.sectionCardActive]}>
+        {isDone && <View style={styles.sectionGreyBar} />}
+        <Animated.View pointerEvents="none" style={[styles.sectionAccentBar, { opacity: accentOpacity }]} />
         {isDone ? (
           <>
             <View style={{ flex: 1 }}>
@@ -2144,9 +2302,13 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
             onScrollBeginDrag={() => Keyboard.dismiss()}>
 
             <AppearingSection>
-              <SectionWrap title="Game Type" summary={draft.gameType === 'cash' ? 'Cash Game' : draft.gameType === 'tournament' ? 'Tournament' : ''} isDone={step > 1} noAccent={step === 1}>
-                {step === 1 && <StepGameType draft={draft} set={set} onNext={next} />}
-              </SectionWrap>
+              {step === 1 ? (
+                <StepGameType draft={draft} set={set} onNext={next} />
+              ) : (
+                <SectionWrap title="Game Type" summary={draft.gameType === 'cash' ? 'Cash Game' : 'Tournament'} isDone>
+                  {null}
+                </SectionWrap>
+              )}
             </AppearingSection>
 
             {step >= 2 && (
@@ -2287,8 +2449,6 @@ const styles = StyleSheet.create({
   sectionCard:   { backgroundColor: C.backgroundElement, borderRadius: 10, paddingVertical: 14, paddingRight: 14, paddingLeft: 17, position: 'relative', overflow: 'hidden' },
   sectionCardActive: { gap: 14 },
   sectionCardDone:   { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  // No accent bar reserved — symmetric padding, plain card.
-  sectionCardPlain:  { paddingLeft: 14 },
   sectionAccentBar:  { position: 'absolute', left: 0, top: 0, bottom: 0, width: 3, backgroundColor: HERO_COLOR },
   sectionGreyBar:    { position: 'absolute', left: 0, top: 0, bottom: 0, width: 3, backgroundColor: C.backgroundSelected },
   sectionDoneSummary: { fontSize: 14, fontWeight: '600', color: C.text },
