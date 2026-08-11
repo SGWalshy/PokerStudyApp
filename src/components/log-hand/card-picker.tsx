@@ -76,11 +76,22 @@ export function CardPicker({
     onPendingChange?.(r);
   };
 
+  // A card already sitting in one of THIS picker's other slots (e.g. the
+  // first flop card while picking the second) is just as unavailable as one
+  // used elsewhere in the hand — merge it in here so every caller gets that
+  // for free, regardless of what it passes as `usedCards`. The active slot
+  // itself is excluded so re-tapping a filled slot to change it doesn't
+  // lock out the very card it's currently holding.
+  const allUsedCards: CardType[] = [
+    ...usedCards,
+    ...(cards.filter((c, idx) => idx !== activeSlot && c !== null) as CardType[]),
+  ];
+
   const isCardUsed = (rank: Rank, suit?: Suit): boolean => {
     if (suit) {
-      return usedCards.some(c => c.rank === rank && c.suit === suit);
+      return allUsedCards.some(c => c.rank === rank && c.suit === suit);
     }
-    return usedCards.every(c => c.rank === rank); // all 4 suits used
+    return SUITS.every(s => allUsedCards.some(c => c.rank === rank && c.suit === s));
   };
 
   const handleRank = (rank: Rank) => {

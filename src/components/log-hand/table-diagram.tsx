@@ -6,12 +6,19 @@ import { POSITION_LABELS } from './types';
 const C = Colors.light;
 
 const W = 300;
-const H = 180;
 const SEAT = 24;
+// A seat at the ellipse's exact topmost point (e.g. LJ at 6-max) only had a
+// 4px gap before the container's top edge — easy to clip against the
+// section card's overflow:hidden, especially mid-accordion resize. TOP_PAD
+// shifts the whole ellipse down inside a taller container without changing
+// its shape, giving every seat real clearance on every side.
+const TOP_PAD = 12;
+const ELLIPSE_H = 180;
+const H = ELLIPSE_H + TOP_PAD;
 const CX = W / 2;
-const CY = H / 2;
+const CY = TOP_PAD + ELLIPSE_H / 2;
 const RX = W / 2 - SEAT - 6;
-const RY = H / 2 - SEAT - 4;
+const RY = ELLIPSE_H / 2 - SEAT - 4;
 
 // Villain color progression: first = solid red, second = orange-red, third = amber-red
 const VILLAIN_COLORS = ['#C04040', '#D4683A', '#C8942A'];
@@ -114,7 +121,7 @@ export function TableDiagram({ playerCount, heroSeat, villainSeats, onSeatPress,
 const styles = StyleSheet.create({
   felt: {
     position: 'absolute',
-    top: SEAT,
+    top: SEAT + TOP_PAD,
     left: SEAT,
     right: SEAT,
     bottom: SEAT,

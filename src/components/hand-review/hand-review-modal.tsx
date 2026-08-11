@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Alert,
   Clipboard,
@@ -15,35 +15,49 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import * as Sharing from 'expo-sharing';
+import ViewShot from 'react-native-view-shot';
 
 import { Colors, Spacing } from '@/constants/theme';
+import { useAppData } from '@/state/app-data';
+import { Group } from '@/utils/groups-storage';
+import { rankShowdown } from '@/utils/poker-hand-evaluator';
+import { withTimeout } from '@/utils/promise-utils';
 import { CardFace } from '../log-hand/card-picker';
+import { HandHistoryCard, VillainCardsToggle } from '../log-hand/hand-history-card';
 import {
   ActionEntry,
   AnyAction,
   CardType,
-  HandDraft,
   POSITION_LABELS,
   autoHandName,
+  computeFoldWinNet,
+  computeHandMath,
+  computeHandOutcome,
+  fmtDualAmount,
   holeCardsLabel,
+  villainLabel,
+  heroLabel,
 } from '../log-hand/types';
 import {
-  ACTION_PROMPTS,
   ActionNote,
-  CONCEPT_TAG_PRESETS,
-  INITIAL_REVIEW,
-  MISTAKE_CATEGORIES,
-  STREET_PROMPTS,
-  STUDY_FLAGS,
-  DecisionRating,
+  FLAG_COLOR_PALETTE,
+  Flag,
   HandRecord,
   HandReview,
-  MistakeCategory,
+  INITIAL_REVIEW,
   ReviewStatus,
   computeStatus,
 } from './types';
 
 const C = Colors.light;
+
+// Notes input — near-white so the writable area reads as lighter than the
+// card around it, with typed text a soft dark-grey and placeholder text
+// lighter again, so the hierarchy reads empty-state → typed → emphasized.
+const NOTE_INPUT_BG = '#FAF7F2';
+const NOTE_PLACEHOLDER_COLOR = '#C8C0B0';
+const NOTE_TEXT_COLOR = '#6A6A5A';
 
 function DoneLink() {
   return (
@@ -64,13 +78,13 @@ const ACTION_PILL_COLOR: Record<string, string> = {
   allin: '#C04040',
 };
 
-function fmtBB(bb: number): string {
-  return bb % 1 === 0 ? `${bb}BB` : `${bb.toFixed(1)}BB`;
-}
+// Every amount display in this screen goes through fmtDualAmount — a cash
+// hand gets a $ sign, a tournament gets a bare (K/M-compact) number, both
+// followed by the BB equivalent in brackets; never the word "chips".
+type AmountOpts = Parameters<typeof fmtDualAmount>[1];
 
-function actionLabel(action: AnyAction, sizingBB: number, showChips: boolean, bigBlind: number): string {
-  const fmt = (bb: number) =>
-    showChips && bigBlind > 0 ? `$${(bb * bigBlind).toFixed(0)}` : fmtBB(bb);
+function actionLabel(action: AnyAction, sizingBB: number, amountOpts: AmountOpts): string {
+  const fmt = (bb: number) => fmtDualAmount(bb, amountOpts);
   switch (action) {
     case 'fold':  return 'Folds';
     case 'check': return 'Checks';
@@ -122,51 +136,40 @@ function FlagTag({ label, color, onRemove }: { label: string; color: string; onR
   );
 }
 
-function PromptRow({ prompts, onSelect }: { prompts: string[]; onSelect: (p: string) => void }) {
-  return (
-    <ScrollView horizontal showsHorizontalScrollIndicator={false}
-      style={styles.promptScroll} contentContainerStyle={styles.promptRow}>
-      {prompts.map(p => (
-        <Pressable key={p} onPress={() => onSelect(p)} style={styles.promptChip}>
-          <Text style={styles.promptChipText}>{p}</Text>
-        </Pressable>
-      ))}
-    </ScrollView>
-  );
-}
-
 // ─── NoteEditor ───────────────────────────────────────────────────────────────
 
 interface NoteEditorProps {
   note: string;
-  flags: string[];
-  prompts: string[];
+  flags: Flag[];
   placeholder: string;
   onNoteChange: (text: string) => void;
-  onFlagToggle: (flag: string) => void;
-  onCustomFlag: (label: string) => void;
+  onAddFlag: (flag: Flag) => void;
+  onRemoveFlag: (index: number) => void;
 }
 
-function NoteEditor({ note, flags, prompts, placeholder, onNoteChange, onFlagToggle, onCustomFlag }: NoteEditorProps) {
-  const [showFlags, setShowFlags]       = useState(false);
-  const [customFlagText, setCustomFlag] = useState('');
+function NoteEditor({ note, flags, placeholder, onNoteChange, onAddFlag, onRemoveFlag }: NoteEditorProps) {
+  const [adding, setAdding] = useState(false);
+  const [flagText, setFlagText] = useState('');
+  const [flagColor, setFlagColor] = useState(FLAG_COLOR_PALETTE[0]);
 
-  const submitCustomFlag = () => {
-    const t = customFlagText.trim();
-    if (t) { onCustomFlag(t); setCustomFlag(''); }
+  const submitFlag = () => {
+    const t = flagText.trim();
+    if (!t) return;
+    onAddFlag({ label: t, color: flagColor });
+    setFlagText('');
+    setFlagColor(FLAG_COLOR_PALETTE[0]);
+    setAdding(false);
   };
 
   return (
     <View style={styles.noteEditor}>
-      <PromptRow prompts={prompts} onSelect={p => onNoteChange(note ? `${note}\n\n${p}\n` : `${p}\n`)} />
-
       <TextInput
         style={styles.noteInput}
         multiline
         value={note}
         onChangeText={onNoteChange}
         placeholder={placeholder}
-        placeholderTextColor={C.textSecondary}
+        placeholderTextColor={NOTE_PLACEHOLDER_COLOR}
         textAlignVertical="top"
       />
       <DoneLink />
@@ -174,49 +177,43 @@ function NoteEditor({ note, flags, prompts, placeholder, onNoteChange, onFlagTog
       {/* Active flags */}
       {flags.length > 0 && (
         <View style={styles.flagRow}>
-          {flags.map(f => {
-            const def = STUDY_FLAGS.find(d => d.key === f) ?? { label: f, color: '#666' };
-            return <FlagTag key={f} label={def.label} color={def.color} onRemove={() => onFlagToggle(f)} />;
-          })}
+          {flags.map((f, i) => (
+            <FlagTag key={`${f.label}_${i}`} label={f.label} color={f.color} onRemove={() => onRemoveFlag(i)} />
+          ))}
         </View>
       )}
 
-      <Pressable onPress={() => setShowFlags(v => !v)} style={styles.flagToggleBtn}>
-        <Text style={styles.flagToggleBtnText}>
-          {showFlags ? '▲ Hide flags' : '▼ Study flags'}{flags.length > 0 ? ` · ${flags.length} active` : ''}
-        </Text>
-      </Pressable>
-
-      {showFlags && (
-        <View style={styles.flagGrid}>
-          {STUDY_FLAGS.map(def => {
-            const active = flags.includes(def.key);
-            return (
-              <Pressable key={def.key} onPress={() => onFlagToggle(def.key)}
-                style={[styles.flagGridItem,
-                  { borderColor: def.color + (active ? 'cc' : '44'),
-                    backgroundColor: active ? def.color + '22' : 'transparent' }]}>
-                <Text style={[styles.flagGridText, { color: active ? def.color : C.textSecondary }]}>
-                  {def.label}
-                </Text>
-              </Pressable>
-            );
-          })}
-          <View style={styles.customFlagRow}>
-            <TextInput
-              style={styles.customFlagInput}
-              value={customFlagText}
-              onChangeText={setCustomFlag}
-              placeholder="Custom flag…"
-              placeholderTextColor={C.textSecondary}
-              returnKeyType="done"
-              onSubmitEditing={submitCustomFlag}
-            />
-            <Pressable onPress={submitCustomFlag} style={styles.customFlagAdd}>
+      {adding ? (
+        <View style={styles.addFlagForm}>
+          <TextInput
+            style={styles.customFlagInput}
+            value={flagText}
+            onChangeText={setFlagText}
+            placeholder="Flag text…"
+            placeholderTextColor={C.textSecondary}
+            returnKeyType="done"
+            onSubmitEditing={submitFlag}
+            autoFocus
+          />
+          <View style={styles.colorSwatchRow}>
+            {FLAG_COLOR_PALETTE.map(c => (
+              <Pressable key={c} onPress={() => setFlagColor(c)} hitSlop={4}
+                style={[styles.colorSwatch, { backgroundColor: c }, flagColor === c && styles.colorSwatchActive]} />
+            ))}
+          </View>
+          <View style={styles.addFlagFormActions}>
+            <Pressable onPress={() => { setAdding(false); setFlagText(''); }} style={styles.flagCancelBtn}>
+              <Text style={styles.flagCancelBtnText}>Cancel</Text>
+            </Pressable>
+            <Pressable onPress={submitFlag} style={styles.customFlagAdd}>
               <Text style={styles.customFlagAddText}>Add</Text>
             </Pressable>
           </View>
         </View>
+      ) : (
+        <Pressable onPress={() => setAdding(true)} style={styles.addFlagBtn}>
+          <Text style={styles.addFlagBtnText}>+ Add Flag</Text>
+        </Pressable>
       )}
     </View>
   );
@@ -230,28 +227,23 @@ interface ActionRowProps {
   entry:      ActionEntry;
   note:       ActionNote | undefined;
   isExpanded: boolean;
-  showChips:  boolean;
-  bigBlind:   number;
+  amountOpts: AmountOpts;
   onToggle:   () => void;
-  onNoteChange:  (text: string) => void;
-  onFlagToggle:  (flag: string) => void;
-  onCustomFlag:  (label: string) => void;
+  onNoteChange: (text: string) => void;
+  onAddFlag:    (flag: Flag) => void;
+  onRemoveFlag: (index: number) => void;
 }
 
 function ReviewActionRow({
   actorLabel, dotColor, entry, note, isExpanded,
-  showChips, bigBlind, onToggle, onNoteChange, onFlagToggle, onCustomFlag,
+  amountOpts, onToggle, onNoteChange, onAddFlag, onRemoveFlag,
 }: ActionRowProps) {
-  const hasNote = !!(note?.note.trim()) || (note?.flags.length ?? 0) > 0;
-  const prompts = ACTION_PROMPTS[entry.action] ?? ACTION_PROMPTS['check'];
-
   return (
     <View style={styles.actionRowWrap}>
       <Pressable onPress={onToggle} style={styles.actionRow}>
         <View style={styles.actionRowLeft}>
           <View style={[styles.actorDot, { backgroundColor: dotColor }]} />
           <Text style={styles.actorName}>{actorLabel}</Text>
-          {hasNote && <Text style={styles.noteIcon}>✎</Text>}
           {(note?.flags.length ?? 0) > 0 && (
             <View style={styles.flagBadge}>
               <Text style={styles.flagBadgeText}>{note!.flags.length}</Text>
@@ -259,9 +251,9 @@ function ReviewActionRow({
           )}
         </View>
         <View style={styles.actionRowRight}>
-          <Text style={styles.actionText}>{actionLabel(entry.action, entry.sizingBB, showChips, bigBlind)}</Text>
+          <Text style={styles.actionText}>{actionLabel(entry.action, entry.sizingBB, amountOpts)}</Text>
           <ActionPill action={entry.action} />
-          <Text style={styles.expandArrow}>{isExpanded ? '▲' : '▼'}</Text>
+          <Text style={[styles.pencilIcon, isExpanded && styles.pencilIconActive]}>✎</Text>
         </View>
       </Pressable>
 
@@ -269,11 +261,10 @@ function ReviewActionRow({
         <NoteEditor
           note={note?.note ?? ''}
           flags={note?.flags ?? []}
-          prompts={prompts}
           placeholder="Add your thoughts on this action…"
           onNoteChange={onNoteChange}
-          onFlagToggle={onFlagToggle}
-          onCustomFlag={onCustomFlag}
+          onAddFlag={onAddFlag}
+          onRemoveFlag={onRemoveFlag}
         />
       )}
     </View>
@@ -288,21 +279,20 @@ interface StreetSectionProps {
   boardCards?: (CardType | null)[];
   review:      HandReview;
   expandedKey: string | null;
-  showChips:   boolean;
-  bigBlind:    number;
+  amountOpts:  AmountOpts;
   actorLabel:  (actor: string) => string;
   actorDot:    (actor: string) => string;
   isNamed:     (actor: string) => boolean;
   onToggle:    (key: string) => void;
-  onNoteChange:(key: string, text: string) => void;
-  onFlagToggle:(key: string, flag: string) => void;
-  onCustomFlag:(key: string, label: string) => void;
+  onNoteChange: (key: string, text: string) => void;
+  onAddFlag:    (key: string, flag: Flag) => void;
+  onRemoveFlag: (key: string, index: number) => void;
 }
 
 function StreetSection({
   street, actions, boardCards, review, expandedKey,
-  showChips, bigBlind, actorLabel, actorDot, isNamed,
-  onToggle, onNoteChange, onFlagToggle, onCustomFlag,
+  amountOpts, actorLabel, actorDot, isNamed,
+  onToggle, onNoteChange, onAddFlag, onRemoveFlag,
 }: StreetSectionProps) {
   const cap           = street.charAt(0).toUpperCase() + street.slice(1);
   const streetNoteKey = `street_${street}`;
@@ -338,19 +328,18 @@ function StreetSection({
             entry={e}
             note={review.actionNotes[noteKey]}
             isExpanded={expandedKey === noteKey}
-            showChips={showChips}
-            bigBlind={bigBlind}
+            amountOpts={amountOpts}
             onToggle={() => onToggle(noteKey)}
             onNoteChange={t => onNoteChange(noteKey, t)}
-            onFlagToggle={f => onFlagToggle(noteKey, f)}
-            onCustomFlag={l => onCustomFlag(noteKey, l)}
+            onAddFlag={f => onAddFlag(noteKey, f)}
+            onRemoveFlag={i => onRemoveFlag(noteKey, i)}
           />
         );
       })}
 
       <Pressable onPress={() => onToggle(streetNoteKey)} style={styles.streetNoteToggle}>
-        <Text style={styles.streetNoteToggleText}>
-          {sNoteOpen ? '▲' : '▼'} {cap} thoughts{streetNote?.note.trim() ? ' ✎' : ''}
+        <Text style={[styles.streetNoteToggleText, sNoteOpen && styles.pencilIconActive]}>
+          ✎ {cap} thoughts
         </Text>
       </Pressable>
 
@@ -358,11 +347,10 @@ function StreetSection({
         <NoteEditor
           note={streetNote?.note ?? ''}
           flags={streetNote?.flags ?? []}
-          prompts={STREET_PROMPTS}
           placeholder={`${cap} thoughts…`}
           onNoteChange={t => onNoteChange(streetNoteKey, t)}
-          onFlagToggle={f => onFlagToggle(streetNoteKey, f)}
-          onCustomFlag={l => onCustomFlag(streetNoteKey, l)}
+          onAddFlag={f => onAddFlag(streetNoteKey, f)}
+          onRemoveFlag={i => onRemoveFlag(streetNoteKey, i)}
         />
       )}
     </View>
@@ -381,16 +369,31 @@ interface Props {
 }
 
 export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate, onOpenRecord }: Props) {
+  const { groups, shareHandToGroup, toggleHandFlag } = useAppData();
   const [review, setReview]             = useState<HandReview>(INITIAL_REVIEW);
   const [expandedKey, setExpanded]      = useState<string | null>(null);
   const [customTagInput, setCustomTag]  = useState('');
-  const [showReviewedMsg, setRevMsg]    = useState(false);
+  const [sharingImage, setSharingImage] = useState(false);
+  const [groupPickerOpen, setGroupPickerOpen] = useState(false);
+  // Most people sharing a hand don't want to spoil what villain held.
+  const [hideVillainCards, setHideVillainCards] = useState(true);
+  // Tapping Share opens this small confirm sheet (toggle + Share/Cancel)
+  // instead of showing the full card inline — the review screen stays
+  // clean, and the card itself is only ever generated off-screen for the
+  // actual capture.
+  const [shareSheetOpen, setShareSheetOpen] = useState(false);
+  // Local mirror of record.flagged — toggleHandFlag mutates global state,
+  // which this modal's `record` prop (a snapshot held by the parent) won't
+  // pick up until it's closed and reopened, so the button needs its own
+  // copy for instant feedback.
+  const [flagged, setFlagged] = useState(false);
+  const viewShotRef = useRef<ViewShot>(null);
 
   useEffect(() => {
     if (record) {
       setReview(record.review);
       setExpanded(null);
-      setRevMsg(record.review.markedReviewed);
+      setFlagged(record.flagged);
     }
   }, [record?.id]);
 
@@ -411,11 +414,12 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
 
   const actorLabel = (actor: string): string => {
     if (!draft) return actor;
-    if (actor === 'hero') return `Hero (${heroPos})`;
+    if (actor === 'hero') return `${heroLabel(draft.heroName)} (${heroPos})`;
     if (actor.startsWith('villain')) {
       const vi   = parseInt(actor.replace('villain', ''), 10) - 1;
       const seat = draft.villainSeats[vi];
-      return seat !== undefined ? `V${vi + 1} (${labels[seat] ?? '?'})` : `V${vi + 1}`;
+      const name = villainLabel(actor, draft.villainNames);
+      return seat !== undefined ? `${name} (${labels[seat] ?? '?'})` : name;
     }
     return actor;
   };
@@ -426,12 +430,79 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
     return '#9A9080';
   };
 
-  const showChips = draft?.stackUnit === 'Chips' && (draft?.bigBlind ?? 0) > 0;
   const bigBlind  = draft?.bigBlind ?? 2;
+  const amountOpts: AmountOpts = { stackUnit: draft?.stackUnit ?? 'BB', bigBlind, gameType: draft?.gameType ?? null };
   const handTitle = draft ? (draft.handName.trim() || autoHandName(draft)) : record.displayPositions;
 
-  const heroWon  = draft ? (!draft.heroFolded && (draft.result === 'won' || draft.villainMucked)) : null;
-  const heroLost = draft ? (draft.heroFolded || draft.result === 'lost') : null;
+  const fmtChipAmt = (bb: number) => fmtDualAmount(bb, amountOpts);
+
+  // ── Result — always recalculated straight from the logged hand action
+  // data on every render, never a separately stored field or something the
+  // user has to fill in. This runs the same way for a hand logged five
+  // minutes ago and one logged before this logic existed — there's no
+  // "already computed" result sitting in storage to go stale. ─────────────
+  const handOutcome = draft ? computeHandOutcome(draft) : null;
+  const handMath    = draft ? computeHandMath(draft) : null;
+  const finalPotBB  = handMath ? handMath.finalPotBB : record.displayPotSize;
+  const heroInvested = handMath
+    ? (handMath.pf.investedBB['hero'] ?? 0) + (handMath.flop.investedBB['hero'] ?? 0)
+      + (handMath.turn.investedBB['hero'] ?? 0) + (handMath.river.investedBB['hero'] ?? 0)
+    : 0;
+
+  // A real showdown's winner is determined by comparing actual hand
+  // strength — the one outcome that can be computed purely from the logged
+  // cards without any manual "who won" input. Needs a complete board and
+  // every live player's hole cards on record; if any of that is missing (a
+  // villain's cards were never entered), there's honestly no winner that
+  // can be reported — but the result never falls back to the bare word
+  // "Showdown" either, it says plainly why no winner is shown.
+  const showdownWinners: string[] | null = (() => {
+    if (!draft || handOutcome?.situation !== 'showdown') return null;
+    const board = [...draft.flopCards, draft.turnCard, draft.riverCard].filter(Boolean) as CardType[];
+    if (board.length !== 5 || !draft.card1 || !draft.card2) return null;
+    const entrants: { key: string; cards: CardType[] }[] = [{ key: 'hero', cards: [draft.card1, draft.card2, ...board] }];
+    for (const vKey of handOutcome.liveVillains) {
+      const [c1, c2] = draft.villainHoleCards[vKey] ?? [null, null];
+      if (!c1 || !c2) return null;
+      entrants.push({ key: vKey, cards: [c1, c2, ...board] });
+    }
+    return rankShowdown(entrants);
+  })();
+
+  type ResultKind = 'hero_folded' | 'villain_folded' | 'hero_won_showdown' | 'villain_won_showdown' | 'split_pot_showdown' | 'pending_showdown' | 'unknown';
+
+  const resultKind: ResultKind = !draft || !handOutcome ? 'unknown'
+    : handOutcome.situation === 'hero_folded'    ? 'hero_folded'
+    : handOutcome.situation === 'villain_folded' ? 'villain_folded'
+    : !showdownWinners ? 'pending_showdown'
+    : showdownWinners.length > 1 ? 'split_pot_showdown'
+    : showdownWinners[0] === 'hero' ? 'hero_won_showdown'
+    : 'villain_won_showdown';
+
+  // "+$1.5K (7.5BB)" / "+1.5K (7.5BB)" / "+7.5BB" — always the WINNER's own
+  // net gain (never negative, so always a "+"), a $ sign only for a cash
+  // hand, K/M-compact for a tournament, never the word "chips". Kept to
+  // just this — no extra clauses — so it can never overflow its banner.
+  const fmtNetGain = (bb: number) => `+${fmtDualAmount(Math.abs(bb), amountOpts)}`;
+
+  const result = (() => {
+    switch (resultKind) {
+      case 'hero_folded':
+        return { text: `Villain ${fmtNetGain(heroInvested)}`, icon: '✗', color: '#B83232', bg: '#FCE8E8' };
+      case 'villain_folded':
+        return { text: `Hero ${fmtNetGain(draft && handMath ? computeFoldWinNet(draft, handMath) : 0)}`, icon: '✓', color: '#1B4332', bg: '#E6F4EC' };
+      case 'hero_won_showdown':
+        return { text: `Hero ${fmtNetGain(finalPotBB - heroInvested)}`, icon: '✓', color: '#1B4332', bg: '#E6F4EC' };
+      case 'villain_won_showdown':
+        return { text: `${draft ? villainLabel(showdownWinners![0], draft.villainNames) : 'Villain'} ${fmtNetGain(heroInvested)}`, icon: '✗', color: '#B83232', bg: '#FCE8E8' };
+      case 'split_pot_showdown':
+        return { text: `Split pot ${fmtNetGain(finalPotBB / showdownWinners!.length - heroInvested)}`, icon: '½', color: '#6B5020', bg: '#EEE8D8' };
+      case 'pending_showdown':
+        return { text: `Winner not recorded — villain cards weren't entered`, icon: '?', color: '#6B5020', bg: '#EEE8D8' };
+      default:
+        return { text: 'Result not recorded', icon: '?', color: C.textSecondary, bg: C.backgroundElement };
+    }
+  })();
 
   // ── Similar hands ─────────────────────────────────────────────────────────
 
@@ -467,27 +538,30 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
     }
   };
 
-  const handleFlagToggle = (key: string, flag: string) => {
+  const handleAddFlag = (key: string, flag: Flag) => {
     const isStreet = key.startsWith('street_');
     if (isStreet) {
       const prev = review.streetNotes[key]?.flags ?? [];
-      const next = prev.includes(flag) ? prev.filter(f => f !== flag) : [...prev, flag];
       update({ streetNotes: { ...review.streetNotes,
-        [key]: { note: review.streetNotes[key]?.note ?? '', flags: next } } });
+        [key]: { note: review.streetNotes[key]?.note ?? '', flags: [...prev, flag] } } });
     } else {
       const prev = review.actionNotes[key]?.flags ?? [];
-      const next = prev.includes(flag) ? prev.filter(f => f !== flag) : [...prev, flag];
       update({ actionNotes: { ...review.actionNotes,
-        [key]: { note: review.actionNotes[key]?.note ?? '', flags: next } } });
+        [key]: { note: review.actionNotes[key]?.note ?? '', flags: [...prev, flag] } } });
     }
   };
 
-  const handleCustomFlag = (key: string, label: string) => handleFlagToggle(key, label);
-
-  const toggleMistakeCategory = (cat: MistakeCategory) => {
-    const prev = review.mistakeCategories;
-    const next = prev.includes(cat) ? prev.filter(c => c !== cat) : [...prev, cat];
-    update({ mistakeCategories: next });
+  const handleRemoveFlag = (key: string, index: number) => {
+    const isStreet = key.startsWith('street_');
+    if (isStreet) {
+      const prev = review.streetNotes[key]?.flags ?? [];
+      update({ streetNotes: { ...review.streetNotes,
+        [key]: { note: review.streetNotes[key]?.note ?? '', flags: prev.filter((_, i) => i !== index) } } });
+    } else {
+      const prev = review.actionNotes[key]?.flags ?? [];
+      update({ actionNotes: { ...review.actionNotes,
+        [key]: { note: review.actionNotes[key]?.note ?? '', flags: prev.filter((_, i) => i !== index) } } });
+    }
   };
 
   const toggleConceptTag = (tag: string) => {
@@ -497,10 +571,25 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
     update({ conceptTags: next });
   };
 
-  const handleMarkReviewed = () => {
-    const reviewedAt = new Date().toISOString();
-    update({ markedReviewed: true, reviewedAt });
-    setRevMsg(true);
+  // Reviewed and Partially Reviewed are two faces of the same status field —
+  // selecting one clears the other. Tapping an already-active one clears it
+  // back to unreviewed (unless there's still enough review content for
+  // computeStatus to call it in-progress on its own).
+  const setReviewedStatus = (target: 'reviewed' | 'partial' | null) => {
+    update({
+      markedReviewed: target === 'reviewed',
+      partiallyReviewed: target === 'partial',
+      reviewedAt: target === 'reviewed' ? new Date().toISOString() : undefined,
+    });
+  };
+  const toggleMarkedReviewed  = () => setReviewedStatus(review.markedReviewed ? null : 'reviewed');
+  const togglePartiallyReviewed = () => setReviewedStatus(review.partiallyReviewed ? null : 'partial');
+
+  // Flag is independent of review status — a hand can be flagged whether
+  // it's unreviewed, partially reviewed, or fully reviewed.
+  const toggleFlagged = () => {
+    setFlagged(f => !f);
+    toggleHandFlag(record.id);
   };
 
   // ── Share ─────────────────────────────────────────────────────────────────
@@ -510,7 +599,7 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
     lines.push(`HAND: ${handTitle}`);
     lines.push(`Date: ${shortDate(record.createdAt)}`);
     if (draft) {
-      lines.push(`Positions: ${record.displayPositions} | Stack: ${draft.effectiveStackBB}BB | Pot type: ${draft.potType}`);
+      lines.push(`Positions: ${record.displayPositions} | Stack: ${fmtChipAmt(draft.effectiveStackBB)} | Pot type: ${draft.potType}`);
     }
     lines.push('');
 
@@ -521,13 +610,13 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
       named.forEach(({ e, i }) => {
         const key = `${street}_${i}`;
         const an  = review.actionNotes[key];
-        lines.push(`  ${actorLabel(e.actor)}: ${actionLabel(e.action, e.sizingBB, showChips, bigBlind)}`);
+        lines.push(`  ${actorLabel(e.actor)}: ${actionLabel(e.action, e.sizingBB, amountOpts)}`);
         if (an?.note.trim()) lines.push(`    Note: ${an.note.trim()}`);
-        if (an?.flags.length) lines.push(`    Flags: ${an.flags.join(', ')}`);
+        if (an?.flags.length) lines.push(`    Flags: ${an.flags.map(f => f.label).join(', ')}`);
       });
       const sn = review.streetNotes[`street_${street}`];
       if (sn?.note.trim()) lines.push(`  Thoughts: ${sn.note.trim()}`);
-      if (sn?.flags.length) lines.push(`  Street flags: ${sn.flags.join(', ')}`);
+      if (sn?.flags.length) lines.push(`  Street flags: ${sn.flags.map(f => f.label).join(', ')}`);
       lines.push('');
     };
 
@@ -538,37 +627,67 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
       if (draft.riverActions.length > 0) addStreet('river', draft.riverActions);
     }
 
-    if (heroWon !== null) lines.push(`Result: ${heroWon ? '✓ Won' : '✗ Lost'} (${record.displayPotSize}BB pot)`);
-    if (review.decisionRating) {
-      let line = `Decision: ${review.decisionRating}`;
-      if (review.mistakeCategories.length) line += ` — ${review.mistakeCategories.join(', ')}`;
-      lines.push(line);
-    }
+    if (resultKind !== 'unknown') lines.push(`Result: ${result.text}`);
     if (review.conceptTags.length) lines.push(`Tags: ${review.conceptTags.join(', ')}`);
-
-    if (review.solverOutput.trim()) {
-      lines.push('');
-      lines.push(`SOLVER ANALYSIS:`);
-      lines.push(`  You did: ${actionLabel((draft?.preflopActions[0]?.action ?? 'check'), 0, false, 2)} (see replay)`);
-      if (review.solverRecommends.trim()) lines.push(`  Solver recommends: ${review.solverRecommends.trim()}`);
-      if (review.evDifference.trim())     lines.push(`  EV difference: ${review.evDifference.trim()}`);
-      lines.push(`  Raw output: ${review.solverOutput.trim()}`);
-    }
-
     if (review.overallNotes.trim()) { lines.push(''); lines.push(`Notes: ${review.overallNotes.trim()}`); }
-    if (review.coachFeedback.trim()) { lines.push(''); lines.push(`Coach feedback: ${review.coachFeedback.trim()}`); }
-    if (review.requestCoachReview) lines.push('⚑ Flagged for coach review');
 
     return lines.join('\n');
   };
 
-  const handleShare = async () => {
-    try { await Share.share({ message: buildShareText() }); } catch {}
+  // Same visual card as the Tag & Save screen's "Share Hand" — captured
+  // off-screen from the hidden ViewShot host near the bottom of this modal
+  // (never shown inline here). Falls back to the old text share only if
+  // this record somehow has no draft to render a card from (pre-draft
+  // legacy data).
+  const handleShareImage = async () => {
+    if (!draft) { try { await Share.share({ message: buildShareText() }); } catch {} return; }
+    if (sharingImage) return;
+    setSharingImage(true);
+    console.log('[ShareHand:Review] starting — hideVillainCards =', hideVillainCards);
+    try {
+      // Let the sheet's closing animation and any last-second re-render from
+      // the villain-cards toggle actually flush to the native view before
+      // snapshotting it — capturing mid-transition is a known way for
+      // react-native-view-shot to hang instead of resolving or rejecting.
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      if (!viewShotRef.current?.capture) throw new Error("Share card isn't ready yet — try again in a moment.");
+      console.log('[ShareHand:Review] capturing…');
+      const uri = await withTimeout(viewShotRef.current.capture(), 10000, 'Image generation timed out — please try again.');
+      console.log('[ShareHand:Review] capture returned uri:', uri);
+      if (!uri) throw new Error('No image was generated — please try again.');
+      // Capture succeeded — don't leave the button reading "Preparing…" for
+      // however long the OS share sheet stays open waiting on the user.
+      setSharingImage(false);
+      const canShare = await Sharing.isAvailableAsync();
+      console.log('[ShareHand:Review] Sharing.isAvailableAsync ->', canShare);
+      if (canShare) {
+        await Sharing.shareAsync(uri, { mimeType: 'image/png', dialogTitle: 'Share Hand' });
+        console.log('[ShareHand:Review] shareAsync resolved (sheet closed)');
+      } else {
+        Alert.alert("Sharing isn't available", 'This device has no share sheet to send the image through.');
+      }
+    } catch (err) {
+      console.error('[ShareHand:Review] failed:', err);
+      setSharingImage(false);
+      Alert.alert('Could not share hand', err instanceof Error ? err.message : 'Something went wrong generating the image.');
+    }
   };
+
+  // Tapping "Share hand" opens the small confirm sheet (toggle + Share)
+  // rather than sharing immediately — but only when there's actually a card
+  // to toggle; legacy drafts with no card fall straight to the text share.
+  const openShareSheet = () => { if (draft) setShareSheetOpen(true); else handleShareImage(); };
+  const confirmShareImage = () => { setShareSheetOpen(false); handleShareImage(); };
 
   const handleCopy = () => {
     Clipboard.setString(buildShareText());
     Alert.alert('Copied', 'Hand summary copied to clipboard.');
+  };
+
+  const handleAddToGroup = (group: Group) => {
+    shareHandToGroup(group.id, record.id, '');
+    setGroupPickerOpen(false);
+    Alert.alert('Added', `Hand added to ${group.name}.`);
   };
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -596,11 +715,10 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
         {/* ── Meta row ── */}
         <View style={styles.metaRow}>
           <MetaChip label={record.displayPositions} />
-          {draft && <MetaChip label={`${draft.effectiveStackBB}BB eff.`} />}
+          {draft && <MetaChip label={`${fmtChipAmt(draft.effectiveStackBB)} eff.`} />}
           {draft?.stakes ? <MetaChip label={draft.stakes} /> : null}
           <MetaChip label={record.displayPotType} />
           <MetaChip label={shortDate(record.createdAt)} />
-          {review.requestCoachReview && <MetaChip label="⚑ Coach review" accent />}
         </View>
 
         {/* ── Scrollable body ── */}
@@ -617,33 +735,33 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
               {draft ? (
                 <>
                   <StreetSection street="preflop" actions={draft.preflopActions}
-                    review={review} expandedKey={expandedKey} showChips={showChips} bigBlind={bigBlind}
+                    review={review} expandedKey={expandedKey} amountOpts={amountOpts}
                     actorLabel={actorLabel} actorDot={actorDot} isNamed={a => namedSet.has(a)}
                     onToggle={toggleExpanded} onNoteChange={handleNoteChange}
-                    onFlagToggle={(k, f) => handleFlagToggle(k, f)} onCustomFlag={handleCustomFlag} />
+                    onAddFlag={handleAddFlag} onRemoveFlag={handleRemoveFlag} />
 
                   {(draft.flopCards.some(Boolean) || draft.flopActions.length > 0) && (
                     <StreetSection street="flop" actions={draft.flopActions} boardCards={draft.flopCards}
-                      review={review} expandedKey={expandedKey} showChips={showChips} bigBlind={bigBlind}
+                      review={review} expandedKey={expandedKey} amountOpts={amountOpts}
                       actorLabel={actorLabel} actorDot={actorDot} isNamed={a => namedSet.has(a)}
                       onToggle={toggleExpanded} onNoteChange={handleNoteChange}
-                      onFlagToggle={(k, f) => handleFlagToggle(k, f)} onCustomFlag={handleCustomFlag} />
+                      onAddFlag={handleAddFlag} onRemoveFlag={handleRemoveFlag} />
                   )}
 
                   {(draft.turnCard || draft.turnActions.length > 0) && (
                     <StreetSection street="turn" actions={draft.turnActions} boardCards={[draft.turnCard]}
-                      review={review} expandedKey={expandedKey} showChips={showChips} bigBlind={bigBlind}
+                      review={review} expandedKey={expandedKey} amountOpts={amountOpts}
                       actorLabel={actorLabel} actorDot={actorDot} isNamed={a => namedSet.has(a)}
                       onToggle={toggleExpanded} onNoteChange={handleNoteChange}
-                      onFlagToggle={(k, f) => handleFlagToggle(k, f)} onCustomFlag={handleCustomFlag} />
+                      onAddFlag={handleAddFlag} onRemoveFlag={handleRemoveFlag} />
                   )}
 
                   {(draft.riverCard || draft.riverActions.length > 0) && (
                     <StreetSection street="river" actions={draft.riverActions} boardCards={[draft.riverCard]}
-                      review={review} expandedKey={expandedKey} showChips={showChips} bigBlind={bigBlind}
+                      review={review} expandedKey={expandedKey} amountOpts={amountOpts}
                       actorLabel={actorLabel} actorDot={actorDot} isNamed={a => namedSet.has(a)}
                       onToggle={toggleExpanded} onNoteChange={handleNoteChange}
-                      onFlagToggle={(k, f) => handleFlagToggle(k, f)} onCustomFlag={handleCustomFlag} />
+                      onAddFlag={handleAddFlag} onRemoveFlag={handleRemoveFlag} />
                   )}
                 </>
               ) : (
@@ -651,27 +769,19 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
               )}
             </View>
 
-            {/* RESULT */}
+            {/* RESULT — read-only, always recalculated from the hand's own
+                logged data (actions + whatever cards were recorded at the
+                time), never typed in. To change it, edit the hand itself via
+                swipe-to-edit on the Hands tab — not from here. */}
             <View style={styles.card}>
               <SectionHeader title="Result" />
-              <View style={[styles.resultBanner,
-                heroWon === true  ? styles.resultWon :
-                heroLost === true ? styles.resultLost : styles.resultUnknown]}>
-                <Text style={[styles.resultIcon,
-                  heroWon === true ? { color: '#1B4332' } : heroLost === true ? { color: '#B83232' } : {}]}>
-                  {heroWon === true ? '✓' : heroLost === true ? '✗' : '?'}
-                </Text>
-                <View>
-                  <Text style={[styles.resultText,
-                    heroWon === true ? { color: '#1B4332' } : heroLost === true ? { color: '#B83232' } : { color: C.textSecondary }]}>
-                    {heroWon === true
-                      ? `Won ${record.displayPotSize}BB pot`
-                      : heroLost === true
-                      ? draft?.heroFolded
-                        ? `Folded${draft.foldedOn ? ` on the ${draft.foldedOn}` : ''}`
-                        : `Lost — ${record.displayPotSize}BB pot`
-                      : 'Result not recorded'}
-                  </Text>
+              <View style={[styles.resultBanner, { backgroundColor: result.bg }]}>
+                <Text style={[styles.resultIcon, { color: result.color }]}>{result.icon}</Text>
+                {/* flexShrink: RN Views don't shrink by default (unlike web),
+                    so without this a long result line pushes past the
+                    banner's edge instead of wrapping onto a second line. */}
+                <View style={{ flex: 1, flexShrink: 1 }}>
+                  <Text style={[styles.resultText, { color: result.color }]}>{result.text}</Text>
                 </View>
               </View>
             </View>
@@ -680,68 +790,18 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
             <View style={styles.card}>
               <SectionHeader title="Review" />
 
-              {/* Decision quality */}
-              <SubLabel text="Decision quality" />
-              <View style={styles.ratingRow}>
-                {(['good', 'mistake', 'unsure'] as DecisionRating[]).map(r => {
-                  const active = review.decisionRating === r;
-                  const col    = r === 'good' ? '#2E7D52' : r === 'mistake' ? '#C04040' : '#C8940A';
-                  return (
-                    <Pressable key={r}
-                      onPress={() => update({
-                        decisionRating:   active ? undefined : r,
-                        mistakeCategories: active ? [] : review.mistakeCategories,
-                      })}
-                      style={[styles.ratingBtn,
-                        { borderColor: active ? col : col + '44', backgroundColor: active ? col + '18' : 'transparent' }]}>
-                      <Text style={[styles.ratingBtnText, { color: active ? col : C.textSecondary }]}>
-                        {r === 'good' ? '✓ Good' : r === 'mistake' ? '✗ Mistake' : '~ Unsure'}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-
-              {/* Mistake categories — multi-select */}
-              {review.decisionRating === 'mistake' && (
-                <>
-                  <SubLabel text="Mistake type (select all that apply)" mt={12} />
-                  <View style={styles.mistakeGrid}>
-                    {MISTAKE_CATEGORIES.map(({ key, label }) => {
-                      const active = review.mistakeCategories.includes(key);
-                      return (
-                        <Pressable key={key} onPress={() => toggleMistakeCategory(key)}
-                          style={[styles.mistakeBtn,
-                            active ? { backgroundColor: '#C04040', borderColor: '#C04040' }
-                                   : { borderColor: '#C0404066' }]}>
-                          <Text style={[styles.mistakeBtnText, { color: active ? '#fff' : '#C04040' }]}>
-                            {label}
-                          </Text>
-                        </Pressable>
-                      );
-                    })}
-                  </View>
-                </>
-              )}
-
               {/* Concept tags */}
-              <SubLabel text="Concept tags" mt={16} />
-              <View style={styles.tagGrid}>
-                {[
-                  ...CONCEPT_TAG_PRESETS,
-                  ...review.conceptTags.filter(t => !CONCEPT_TAG_PRESETS.includes(t)),
-                ].map(tag => {
-                  const active = review.conceptTags.includes(tag);
-                  return (
+              <SubLabel text="Concept tags" />
+              {review.conceptTags.length > 0 && (
+                <View style={styles.tagGrid}>
+                  {review.conceptTags.map(tag => (
                     <Pressable key={tag} onPress={() => toggleConceptTag(tag)}
-                      style={[styles.conceptTag,
-                        active ? { backgroundColor: C.tint + '22', borderColor: C.tint }
-                               : { borderColor: C.backgroundSelected }]}>
-                      <Text style={[styles.conceptTagText, active && styles.conceptTagActive]}>{tag}</Text>
+                      style={[styles.conceptTag, { backgroundColor: C.tint + '22', borderColor: C.tint }]}>
+                      <Text style={[styles.conceptTagText, styles.conceptTagActive]}>{tag} ×</Text>
                     </Pressable>
-                  );
-                })}
-              </View>
+                  ))}
+                </View>
+              )}
               <View style={styles.customTagRow}>
                 <TextInput
                   style={styles.customTagInput}
@@ -758,57 +818,6 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
                 />
               </View>
 
-              {/* Solver Analysis */}
-              <SubLabel text="Solver Analysis" mt={16} />
-              <TextInput
-                style={[styles.noteInput, { minHeight: 70 }]}
-                multiline
-                value={review.solverOutput}
-                onChangeText={v => update({ solverOutput: v })}
-                placeholder="Paste raw solver output here…"
-                placeholderTextColor={C.textSecondary}
-                textAlignVertical="top"
-              />
-              <DoneLink />
-              <View style={styles.solverGrid}>
-                <View style={styles.solverRow}>
-                  <Text style={styles.solverRowLabel}>You did:</Text>
-                  <Text style={styles.solverRowValue}>
-                    {draft && draft.preflopActions.filter(e => namedSet.has(e.actor)).length > 0
-                      ? actionLabel(
-                          draft.preflopActions.filter(e => namedSet.has(e.actor)).slice(-1)[0].action,
-                          draft.preflopActions.filter(e => namedSet.has(e.actor)).slice(-1)[0].sizingBB,
-                          showChips, bigBlind,
-                        )
-                      : '—'}
-                  </Text>
-                </View>
-                <View style={styles.solverRow}>
-                  <Text style={styles.solverRowLabel}>Solver recommends:</Text>
-                  <TextInput
-                    style={styles.solverInlineInput}
-                    value={review.solverRecommends}
-                    onChangeText={v => update({ solverRecommends: v })}
-                    placeholder="e.g. Check 70% / Bet 30%"
-                    placeholderTextColor={C.textSecondary}
-                    returnKeyType="done"
-                    onSubmitEditing={() => Keyboard.dismiss()}
-                  />
-                </View>
-                <View style={styles.solverRow}>
-                  <Text style={styles.solverRowLabel}>EV difference:</Text>
-                  <TextInput
-                    style={styles.solverInlineInput}
-                    value={review.evDifference}
-                    onChangeText={v => update({ evDifference: v })}
-                    placeholder="e.g. -0.3BB"
-                    placeholderTextColor={C.textSecondary}
-                    returnKeyType="done"
-                    onSubmitEditing={() => Keyboard.dismiss()}
-                  />
-                </View>
-              </View>
-
               {/* Overall notes */}
               <SubLabel text="Overall notes" mt={16} />
               <TextInput
@@ -817,7 +826,7 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
                 value={review.overallNotes}
                 onChangeText={v => update({ overallNotes: v })}
                 placeholder="What did you learn? Key takeaways…"
-                placeholderTextColor={C.textSecondary}
+                placeholderTextColor={NOTE_PLACEHOLDER_COLOR}
                 textAlignVertical="top"
               />
               <DoneLink />
@@ -842,40 +851,35 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
               </View>
             )}
 
-            {/* COACH */}
+            {/* SHARE */}
             <View style={styles.card}>
-              <SectionHeader title="Coach" />
+              <SectionHeader title="Share" />
 
               <View style={styles.sharingRow}>
-                <Pressable style={styles.sharingBtn}
-                  onPress={() => Alert.alert('Coming soon', 'Study rooms will be available in a future update.')}>
-                  <Text style={styles.sharingBtnText}>📤 Send to coach</Text>
-                </Pressable>
-                <Pressable
-                  onPress={() => update({ requestCoachReview: !review.requestCoachReview })}
-                  style={[styles.sharingBtn,
-                    review.requestCoachReview && { backgroundColor: C.tint + '22', borderColor: C.tint, borderWidth: 1.5 }]}>
-                  <Text style={[styles.sharingBtnText, review.requestCoachReview && { color: C.tint }]}>
-                    {review.requestCoachReview ? '⚑ Review requested' : '⚑ Request feedback'}
-                  </Text>
+                <Pressable style={styles.sharingBtn} onPress={() => setGroupPickerOpen(v => !v)}>
+                  <Text style={styles.sharingBtnText}>Add to Group</Text>
                 </Pressable>
               </View>
 
-              <SubLabel text="Coach feedback" mt={12} />
-              <TextInput
-                style={[styles.noteInput, { minHeight: 80 }]}
-                multiline
-                value={review.coachFeedback}
-                onChangeText={v => update({ coachFeedback: v })}
-                placeholder="Coach feedback appears here…"
-                placeholderTextColor={C.textSecondary}
-                textAlignVertical="top"
-              />
-              <DoneLink />
+              {groupPickerOpen && (
+                <View style={styles.groupPicker}>
+                  {groups.length === 0 ? (
+                    <Text style={styles.groupPickerEmpty}>No groups yet — create one from the Groups tab.</Text>
+                  ) : (
+                    groups.map(g => (
+                      <Pressable key={g.id} onPress={() => handleAddToGroup(g)}
+                        style={({ pressed }) => [styles.groupPickerRow, pressed && { opacity: 0.7 }]}>
+                        <Text style={styles.groupPickerRowText}>{g.name}</Text>
+                        <Text style={styles.similarArrow}>›</Text>
+                      </Pressable>
+                    ))
+                  )}
+                </View>
+              )}
 
               <View style={[styles.sharingRow, { marginTop: 8 }]}>
-                <Pressable style={styles.sharingBtn} onPress={handleShare}>
-                  <Text style={styles.sharingBtnText}>↗ Share hand</Text>
+                <Pressable style={styles.sharingBtn} onPress={openShareSheet} disabled={sharingImage}>
+                  <Text style={styles.sharingBtnText}>{sharingImage ? 'Preparing image…' : '↗ Share hand'}</Text>
                 </Pressable>
                 <Pressable style={styles.sharingBtn} onPress={handleCopy}>
                   <Text style={styles.sharingBtnText}>⎘ Copy to clipboard</Text>
@@ -889,30 +893,68 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
 
         {/* ── Sticky footer ── */}
         <View style={styles.footer}>
-          {showReviewedMsg ? (
-            <View style={styles.reviewedBanner}>
-              <View>
-                <Text style={styles.reviewedBannerText}>✓ Reviewed</Text>
-                {review.reviewedAt && (
-                  <Text style={styles.reviewedDate}>{shortDate(review.reviewedAt)}</Text>
-                )}
-              </View>
-              <View style={styles.reviewedActions}>
-                <Pressable onPress={() => Alert.alert('Coming soon', 'Study rooms in a future update.')}>
-                  <Text style={styles.reviewedStudyRoom}>Add to study room</Text>
+          <View style={styles.statusRow}>
+            <Pressable
+              onPress={toggleMarkedReviewed}
+              style={[styles.statusBtn, review.markedReviewed && styles.statusBtnReviewed]}>
+              <Text style={[styles.statusBtnText, review.markedReviewed && styles.statusBtnTextActive]}>
+                Mark as Reviewed
+              </Text>
+            </Pressable>
+            <Pressable
+              onPress={toggleFlagged}
+              style={[styles.statusBtn, flagged && styles.statusBtnFlagged]}>
+              <Text style={[styles.statusBtnText, flagged && styles.statusBtnTextActive]}>Flag</Text>
+            </Pressable>
+            <Pressable
+              onPress={togglePartiallyReviewed}
+              style={[styles.statusBtn, review.partiallyReviewed && styles.statusBtnPartial]}>
+              <Text style={[styles.statusBtnText, review.partiallyReviewed && styles.statusBtnTextActive]}>
+                Partially Reviewed
+              </Text>
+            </Pressable>
+          </View>
+          <Pressable onPress={onClose} style={styles.reviewBtn}>
+            <Text style={styles.reviewBtnText}>Save</Text>
+          </Pressable>
+        </View>
+
+        {/* Off-screen — outside the ScrollView so it's never clipped —
+            captured for the share image, never shown to the user. The
+            review screen stays clean; only the small sheet below is ever
+            visible before a share. */}
+        {draft && (
+          <View pointerEvents="none" style={styles.hiddenCardHost}>
+            {/* No width/height override — see the matching ViewShot in
+                log-hand-modal.tsx for why: default capture is already at
+                real device pixel resolution, which is the sharpest this
+                library can produce (there's no separate pixelRatio option). */}
+            <ViewShot ref={viewShotRef} options={{ format: 'png', quality: 1, result: 'tmpfile' }}>
+              <HandHistoryCard draft={draft} now={new Date(record.createdAt)} hideVillainCards={hideVillainCards} />
+            </ViewShot>
+          </View>
+        )}
+
+        {/* Share confirm sheet — the only place the villain-cards toggle is
+            ever shown on this screen, and only right before actually
+            sharing, not as a standing preview. */}
+        <Modal visible={shareSheetOpen} transparent animationType="fade" onRequestClose={() => setShareSheetOpen(false)}>
+          <View style={styles.sheetOverlay}>
+            <Pressable style={StyleSheet.absoluteFill} onPress={() => setShareSheetOpen(false)} />
+            <View style={styles.sheetPanel}>
+              <Text style={styles.sheetTitle}>Share Hand</Text>
+              <VillainCardsToggle value={hideVillainCards} onToggle={() => setHideVillainCards(v => !v)} />
+              <View style={styles.sheetActions}>
+                <Pressable onPress={() => setShareSheetOpen(false)} style={styles.sheetCancelBtn}>
+                  <Text style={styles.sheetCancelBtnText}>Cancel</Text>
                 </Pressable>
-                <Pressable onPress={() => { update({ markedReviewed: false, reviewedAt: undefined }); setRevMsg(false); }}>
-                  <Text style={styles.reviewedUndo}>Undo</Text>
+                <Pressable onPress={confirmShareImage} style={styles.sheetShareBtn} disabled={sharingImage}>
+                  <Text style={styles.sheetShareBtnText}>{sharingImage ? 'Preparing…' : 'Share'}</Text>
                 </Pressable>
               </View>
             </View>
-          ) : (
-            <Pressable onPress={handleMarkReviewed} style={styles.reviewBtn}>
-              <Text style={styles.reviewBtnText}>Mark as Reviewed</Text>
-            </Pressable>
-          )}
-        </View>
-
+          </View>
+        </Modal>
       </SafeAreaView>
     </Modal>
   );
@@ -970,12 +1012,12 @@ const styles = StyleSheet.create({
   actionRowLeft:  { flexDirection: 'row', alignItems: 'center', gap: 6, flex: 1 },
   actorDot:       { width: 8, height: 8, borderRadius: 4, flexShrink: 0 },
   actorName:      { fontSize: 13, fontWeight: '600', color: C.text },
-  noteIcon:       { fontSize: 12, color: C.tint },
   flagBadge:      { backgroundColor: C.tint, borderRadius: 9, minWidth: 17, height: 17, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 3 },
   flagBadgeText:  { fontSize: 9, fontWeight: '800', color: '#fff' },
   actionRowRight: { flexDirection: 'row', alignItems: 'center', gap: 5 },
   actionText:     { fontSize: 11, color: C.textSecondary, fontWeight: '500' },
-  expandArrow:    { fontSize: 9, color: C.textSecondary },
+  pencilIcon:       { fontSize: 12, color: C.textSecondary },
+  pencilIconActive: { color: C.tint },
 
   // Pill
   pill:       { borderWidth: 1.5, borderRadius: 6, paddingHorizontal: 7, paddingVertical: 2 },
@@ -983,23 +1025,21 @@ const styles = StyleSheet.create({
 
   // Street note toggle
   streetNoteToggle:     { paddingVertical: 8 },
-  streetNoteToggleText: { fontSize: 12, fontWeight: '600', color: C.tint },
+  streetNoteToggleText: { fontSize: 12, fontWeight: '600', color: C.textSecondary },
 
-  // Note editor
-  noteEditor: { backgroundColor: C.backgroundElement, borderRadius: 10, padding: 10, gap: 8, marginVertical: 2 },
-  noteInput:  { backgroundColor: '#fff', borderRadius: 10, borderWidth: 1, borderColor: C.backgroundSelected, padding: 10, fontSize: 14, color: C.text, minHeight: 80 },
+  // Note editor — dashed border on the input itself so the writable area
+  // reads as tappable even before the pencil icon registers.
+  // Plain wrapper, no background/padding of its own — the dashed-bordered
+  // TextInput below is the only "box" here. A second nested panel behind it
+  // is what made this look like a floating card stuck above the keyboard
+  // once everything else scrolled out of view to bring it into focus.
+  noteEditor: { gap: 8, marginVertical: 2 },
+  // Same cream as the noteEditor wrapper it sits in — the dashed border does
+  // the work of marking it tappable. Typed text is a soft muted grey rather
+  // than the app's near-black default so it feels lighter to read back.
+  noteInput:  { backgroundColor: NOTE_INPUT_BG, borderRadius: 10, borderWidth: 1.5, borderStyle: 'dashed', borderColor: C.backgroundSelected, padding: 10, fontSize: 14, color: NOTE_TEXT_COLOR, minHeight: 80 },
   doneLinkWrap: { alignSelf: 'flex-end', paddingVertical: 4, paddingHorizontal: 2 },
   doneLinkText: { fontSize: 13, fontWeight: '600', color: C.tint },
-
-  // Prompts
-  promptScroll:   { flexGrow: 0 },
-  promptRow:      { flexDirection: 'row', gap: 6, paddingBottom: 2 },
-  promptChip:     { backgroundColor: '#fff', borderRadius: 20, paddingHorizontal: 11, paddingVertical: 5, borderWidth: 1, borderColor: C.backgroundSelected },
-  promptChipText: { fontSize: 11, fontWeight: '600', color: C.tint },
-
-  // Flag toggle button
-  flagToggleBtn:     { alignSelf: 'flex-start' },
-  flagToggleBtnText: { fontSize: 11, fontWeight: '600', color: C.tint },
 
   // Flag row (active)
   flagRow: { flexDirection: 'row', gap: 5, flexWrap: 'wrap' },
@@ -1009,34 +1049,26 @@ const styles = StyleSheet.create({
   flagTagText:   { fontSize: 10, fontWeight: '700' },
   flagTagRemove: { fontSize: 14, fontWeight: '700', lineHeight: 16 },
 
-  // Flag grid
-  flagGrid:     { gap: 5 },
-  flagGridItem: { borderRadius: 8, borderWidth: 1.5, paddingHorizontal: 10, paddingVertical: 6 },
-  flagGridText: { fontSize: 12, fontWeight: '600' },
+  // "+ Add Flag" button + inline form
+  addFlagBtn:     { alignSelf: 'flex-start' },
+  addFlagBtnText: { fontSize: 12, fontWeight: '700', color: C.tint },
+  addFlagForm:        { gap: 8 },
+  addFlagFormActions: { flexDirection: 'row', gap: 8, justifyContent: 'flex-end' },
+  colorSwatchRow:   { flexDirection: 'row', gap: 8 },
+  colorSwatch:      { width: 26, height: 26, borderRadius: 13, borderWidth: 2, borderColor: 'transparent' },
+  colorSwatchActive:{ borderColor: C.text },
+  flagCancelBtn:      { paddingHorizontal: 12, paddingVertical: 6 },
+  flagCancelBtnText:  { fontSize: 12, fontWeight: '600', color: C.textSecondary },
 
-  // Custom flag
-  customFlagRow:    { flexDirection: 'row', gap: 6, alignItems: 'center' },
+  // Custom flag / custom tag input
   customFlagInput:  { flex: 1, backgroundColor: '#fff', borderRadius: 8, borderWidth: 1, borderColor: C.backgroundSelected, paddingHorizontal: 10, paddingVertical: 6, fontSize: 12, color: C.text },
   customFlagAdd:    { backgroundColor: C.tint, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 6 },
   customFlagAddText:{ fontSize: 12, fontWeight: '700', color: '#fff' },
 
   // Result
   resultBanner:  { flexDirection: 'row', alignItems: 'center', gap: 12, borderRadius: 12, padding: 14 },
-  resultWon:     { backgroundColor: '#E6F4EC' },
-  resultLost:    { backgroundColor: '#FCE8E8' },
-  resultUnknown: { backgroundColor: C.backgroundElement },
   resultIcon:    { fontSize: 22, fontWeight: '800' },
   resultText:    { fontSize: 15, fontWeight: '700' },
-
-  // Rating
-  ratingRow:    { flexDirection: 'row', gap: 8 },
-  ratingBtn:    { flex: 1, borderWidth: 2, borderRadius: 10, paddingVertical: 10, alignItems: 'center' },
-  ratingBtnText:{ fontSize: 12, fontWeight: '700' },
-
-  // Mistake
-  mistakeGrid:   { flexDirection: 'row', flexWrap: 'wrap', gap: 7 },
-  mistakeBtn:    { borderWidth: 1.5, borderRadius: 8, paddingHorizontal: 11, paddingVertical: 6 },
-  mistakeBtnText:{ fontSize: 12, fontWeight: '700' },
 
   // Concept tags
   tagGrid:         { flexDirection: 'row', flexWrap: 'wrap', gap: 7 },
@@ -1046,12 +1078,11 @@ const styles = StyleSheet.create({
   customTagRow:    { flexDirection: 'row' },
   customTagInput:  { flex: 1, backgroundColor: C.backgroundElement, borderRadius: 8, borderWidth: 1, borderColor: C.backgroundSelected, paddingHorizontal: 10, paddingVertical: 7, fontSize: 12, color: C.text },
 
-  // Solver
-  solverGrid:        { backgroundColor: C.backgroundElement, borderRadius: 10, padding: 10, gap: 0 },
-  solverRow:         { flexDirection: 'row', alignItems: 'center', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: C.backgroundSelected },
-  solverRowLabel:    { fontSize: 12, fontWeight: '700', color: C.textSecondary, width: 140 },
-  solverRowValue:    { fontSize: 13, fontWeight: '600', color: C.text, flex: 1 },
-  solverInlineInput: { flex: 1, fontSize: 13, color: C.text, padding: 0, fontWeight: '600' },
+  // Group picker
+  groupPicker:       { backgroundColor: C.backgroundElement, borderRadius: 10, padding: 4, marginTop: 8 },
+  groupPickerEmpty:  { fontSize: 12, color: C.textSecondary, padding: 10, textAlign: 'center' },
+  groupPickerRow:    { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 10, paddingHorizontal: 10 },
+  groupPickerRowText:{ fontSize: 13, fontWeight: '600', color: C.text },
 
   // Similar hands
   similarLabel: { fontSize: 12, color: C.textSecondary, fontWeight: '600', marginBottom: 4 },
@@ -1066,14 +1097,32 @@ const styles = StyleSheet.create({
   sharingBtn:    { flex: 1, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 5, backgroundColor: C.backgroundElement, borderRadius: 10, paddingVertical: 10, paddingHorizontal: 6 },
   sharingBtnText:{ fontSize: 12, fontWeight: '600', color: C.tint },
 
+  // Rendered off-screen purely so react-native-view-shot has real, laid-out
+  // dimensions to capture — never visible to the user.
+  hiddenCardHost: { position: 'absolute', top: 0, left: -3000 },
+
+  // Share confirm sheet
+  sheetOverlay:      { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.4)' },
+  sheetPanel:        { backgroundColor: C.background, borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: Spacing.four, paddingBottom: Spacing.six, gap: 16 },
+  sheetTitle:        { fontSize: 16, fontWeight: '800', color: C.text, textAlign: 'center' },
+  sheetActions:      { flexDirection: 'row', gap: 10 },
+  sheetCancelBtn:    { flex: 1, alignItems: 'center', paddingVertical: 13, borderRadius: 12, backgroundColor: C.backgroundElement },
+  sheetCancelBtnText:{ fontSize: 14, fontWeight: '700', color: C.textSecondary },
+  sheetShareBtn:     { flex: 1, alignItems: 'center', paddingVertical: 13, borderRadius: 12, backgroundColor: C.tint },
+  sheetShareBtnText: { fontSize: 14, fontWeight: '700', color: C.tintText },
+
   // Footer
-  footer:             { paddingHorizontal: Spacing.three, paddingVertical: 12, borderTopWidth: 1, borderTopColor: C.backgroundElement },
+  footer:             { paddingHorizontal: Spacing.three, paddingVertical: 12, borderTopWidth: 1, borderTopColor: C.backgroundElement, gap: 10 },
   reviewBtn:          { backgroundColor: C.tint, borderRadius: 14, paddingVertical: 15, alignItems: 'center' },
   reviewBtnText:      { fontSize: 16, fontWeight: '800', color: '#D4EDDA' },
-  reviewedBanner:     { backgroundColor: '#E6F4EC', borderRadius: 14, paddingVertical: 12, paddingHorizontal: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  reviewedBannerText: { fontSize: 15, fontWeight: '700', color: '#1B4332' },
-  reviewedDate:       { fontSize: 11, color: '#2E7D52', marginTop: 2 },
-  reviewedActions:    { flexDirection: 'row', gap: 14, alignItems: 'center' },
-  reviewedStudyRoom:  { fontSize: 12, fontWeight: '700', color: C.tint },
-  reviewedUndo:       { fontSize: 12, fontWeight: '600', color: '#2E7D52' },
+
+  // Status row — Reviewed/Partially Reviewed are mutually exclusive (both
+  // drive the same underlying status); Flag is independent of either.
+  statusRow:          { flexDirection: 'row', gap: 8 },
+  statusBtn:          { flex: 1, alignItems: 'center', paddingVertical: 10, borderRadius: 10, backgroundColor: C.backgroundElement },
+  statusBtnReviewed:  { backgroundColor: C.tint },
+  statusBtnFlagged:   { backgroundColor: C.negative },
+  statusBtnPartial:   { backgroundColor: C.gold },
+  statusBtnText:      { fontSize: 11, fontWeight: '700', color: C.textSecondary, textAlign: 'center' },
+  statusBtnTextActive:{ color: '#fff' },
 });

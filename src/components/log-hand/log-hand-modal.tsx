@@ -3,6 +3,7 @@ import {
   Alert,
   Animated,
   Easing,
+  InputAccessoryView,
   Keyboard,
   KeyboardAvoidingView,
   LayoutAnimation,
@@ -18,11 +19,17 @@ import {
   useWindowDimensions,
   View,
 } from 'react-native';
+import Svg, { Path } from 'react-native-svg';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import * as Sharing from 'expo-sharing';
+import ViewShot from 'react-native-view-shot';
+import * as Haptics from 'expo-haptics';
 
 import { Colors, Spacing } from '@/constants/theme';
+import { withTimeout } from '@/utils/promise-utils';
 import { CardFace, CardPicker } from './card-picker';
 import { TableDiagram } from './table-diagram';
+import { HandHistoryCard, VillainCardsToggle } from './hand-history-card';
 import {
   ActionEntry,
   AnyAction,
@@ -46,12 +53,42 @@ import {
   isBettingComplete,
   getNextActor,
   inferPotType,
+  computeHandOutcome,
+  computeHandMath,
+  computeFoldWinNet,
+  computePotBeforeDecisiveFold,
+  villainLabel,
+  heroLabel,
+  fmtSize,
+  fmtCompact,
+  fmtDualAmount,
+  shouldSkipStreetAction,
+  isAllInRunout,
 } from './types';
 
 const C = Colors.light;
 const VILLAIN_COLORS = ['#C04040', '#D4683A', '#C8942A'];
 const HERO_COLOR     = '#1B4332';
 const UNNAMED_COLOR  = '#8A7A6A';
+// iOS-only keyboard toolbar shown above the numeric pad for the tournament
+// Small Blind / Big Blind fields. Each field gets its OWN nativeID rather
+// than sharing one — a single shared InputAccessoryView reliably shows for
+// whichever field focuses first but can silently fail to reattach when focus
+// moves directly from one TextInput to another sharing the same nativeID, so
+// giving each its own dedicated (identical-looking) accessory sidesteps it.
+const BLINDS_SB_ACCESSORY_ID = 'blinds-confirm-accessory-sb';
+const BLINDS_BB_ACCESSORY_ID = 'blinds-confirm-accessory-bb';
+
+// Static "this is the active section" treatment for the Blinds screen's
+// input groups — solid green outline plus a faint tint of the same colour.
+// No animation. (Position screen keeps its own local glowStyle, unchanged.)
+function sectionHighlightStyle(active: boolean) {
+  if (!active) return {};
+  return {
+    borderColor: HERO_COLOR,
+    backgroundColor: HERO_COLOR + '14',
+  };
+}
 
 const ACTION_COLORS: Record<string, string> = {
   check: '#2E7D52', call: '#2E7D52', bet: '#1565C0',
@@ -120,16 +157,83 @@ function AppearingSection({ children }: { children: ReactNode }) {
   );
 }
 
+// ── Shared press/selection animation primitives ─────────────────────────────
+// Every interactive control in this flow routes through these so the whole
+// modal feels consistent instead of each button reinventing its own timing.
+
+const AnimatedPressableBase = Animated.createAnimatedComponent(Pressable);
+
+// Tactile press feedback: scale to 0.97 on press-in, back to 1 on release/
+// cancel, 100ms each way — fast enough to read as "physical", not sluggish.
+function usePressScale() {
+  const scale = useRef(new Animated.Value(1)).current;
+  const onPressIn = () => {
+    Animated.timing(scale, { toValue: 0.97, duration: 100, easing: Easing.out(Easing.ease), useNativeDriver: true }).start();
+  };
+  const onPressOut = () => {
+    Animated.timing(scale, { toValue: 1, duration: 100, easing: Easing.out(Easing.ease), useNativeDriver: true }).start();
+  };
+  return { scale, onPressIn, onPressOut };
+}
+
+// Cross-fades between an "off" and "on" color pair over 150ms whenever
+// `active` flips — used for every selectable chip/card/preset in the flow so
+// picking an option reads as a smooth fill instead of an instant color snap.
+// backgroundColor/borderColor/color aren't native-driver-eligible, so this
+// value always animates on the JS thread (fine at 150ms for a single chip).
+function useFillAnim(active: boolean) {
+  const fill = useRef(new Animated.Value(active ? 1 : 0)).current;
+  useEffect(() => {
+    Animated.timing(fill, { toValue: active ? 1 : 0, duration: 150, easing: Easing.out(Easing.ease), useNativeDriver: false }).start();
+  }, [active, fill]);
+  return fill;
+}
+
+// Fades in while sliding up slightly — the shared "this just became
+// available/relevant" entrance used for the Continue button appearing,
+// freshly-committed action pills, and the Tag & Save screen's stagger.
+// `delay` lets a list stagger its items instead of popping in together.
+function FadeSlideIn({ children, duration = 200, distance = 12, delay = 0, axis = 'y', style }: {
+  children: ReactNode; duration?: number; distance?: number; delay?: number; axis?: 'x' | 'y'; style?: object;
+}) {
+  const progress = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(progress, { toValue: 1, duration, delay, easing: Easing.out(Easing.ease), useNativeDriver: true }).start();
+    // Intentionally mount-only — this marks "I just appeared", not "my props changed".
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const offset = progress.interpolate({ inputRange: [0, 1], outputRange: [distance, 0] });
+  return (
+    <Animated.View style={[style, {
+      opacity: progress,
+      transform: [axis === 'x' ? { translateX: offset } : { translateY: offset }],
+    }]}>
+      {children}
+    </Animated.View>
+  );
+}
+
+// Generic press-scale wrapper for one-off buttons that don't warrant their
+// own named component (Share/Save/action buttons etc.) — same 0.97/100ms
+// feedback as NextBtn/SkipBtn/Chip, just without prescribing a text style.
+function ScaleButton({ onPress, disabled, style, children }: {
+  onPress: () => void; disabled?: boolean; style?: object; children: ReactNode;
+}) {
+  const { scale, onPressIn, onPressOut } = usePressScale();
+  return (
+    <AnimatedPressableBase onPress={onPress} onPressIn={onPressIn} onPressOut={onPressOut} disabled={disabled}
+      style={[style, { transform: [{ scale }] }]}>
+      {children}
+    </AnimatedPressableBase>
+  );
+}
+
 function DoneLink() {
   return (
     <Pressable onPress={() => Keyboard.dismiss()} style={styles.doneLinkWrap} hitSlop={8}>
       <Text style={styles.doneLinkText}>Done</Text>
     </Pressable>
   );
-}
-
-function fmtSize(n: number): string {
-  return n % 1 === 0 ? n.toFixed(0) : n.toFixed(1);
 }
 
 function abbrevPos(pos: string): string {
@@ -177,50 +281,6 @@ function getRemainingStack(
   return Math.max(0, start - invested);
 }
 
-// Returns true when ≤1 active (non-folded) player can still bet entering this street.
-// This covers: both all-in preflop, one all-in + other called, etc.
-function shouldSkipStreetAction(
-  draft: HandDraft,
-  street: 'flop' | 'turn' | 'river',
-  actingOrder: string[],  // named non-preflop-folded actors
-): boolean {
-  const sbBB   = draft.bigBlind > 0 ? draft.smallBlind / draft.bigBlind : 0.5;
-  const stradBB= draft.straddleEnabled && draft.bigBlind > 0 ? draft.straddleAmount / draft.bigBlind : 0;
-  const ao     = getFullPreflopActorOrder(draft.playerCount, draft.heroSeat, draft.villainSeats);
-  const initInv= buildPreflopInvestments(ao, sbBB, stradBB, draft.playerCount);
-  const pf     = computePreflopState(draft.preflopActions, sbBB, stradBB, initInv);
-
-  // Live entering flop = those not folded or all-in preflop
-  const liveAfterPf = actingOrder.filter(a => !pf.allInActors.has(a) && !pf.foldedActors.has(a));
-  if (liveAfterPf.length <= 1) return true;
-  if (street === 'flop') return false;
-
-  const basePot = pf.potBB;
-  const flopSt  = computeStreetState(draft.flopActions, basePot);
-  const liveAfterFlop = liveAfterPf.filter(a => !flopSt.allInActors.has(a) && !flopSt.foldedActors.has(a));
-  if (liveAfterFlop.length <= 1) return true;
-  if (street === 'turn') return false;
-
-  const turnSt = computeStreetState(draft.turnActions, flopSt.potBB);
-  const liveAfterTurn = liveAfterFlop.filter(a => !turnSt.allInActors.has(a) && !turnSt.foldedActors.has(a));
-  return liveAfterTurn.length <= 1;
-}
-
-// A street with zero recorded actions is ambiguous — it could mean everyone
-// checked (real actions, just no chips) or it could mean the street was
-// never actually played because someone was already all-in. Only the
-// latter should say so instead of the misleading "Checked through".
-function isAllInRunout(draft: HandDraft, street: 'flop' | 'turn' | 'river'): boolean {
-  const sbBB    = draft.bigBlind > 0 ? draft.smallBlind / draft.bigBlind : 0.5;
-  const stradBB = draft.straddleEnabled && draft.bigBlind > 0 ? draft.straddleAmount / draft.bigBlind : 0;
-  const pfActorOrder = getFullPreflopActorOrder(draft.playerCount, draft.heroSeat, draft.villainSeats);
-  const pfInitInv     = buildPreflopInvestments(pfActorOrder, sbBB, stradBB, draft.playerCount);
-  const pfState       = computePreflopState(draft.preflopActions, sbBB, stradBB, pfInitInv);
-  const allNamed      = getStreetActors(draft.heroSeat, draft.villainSeats, draft.playerCount, 'postflop');
-  const actingOrder    = allNamed.filter(a => !pfState.foldedActors.has(a));
-  return shouldSkipStreetAction(draft, street, actingOrder);
-}
-
 // ── Primitives ────────────────────────────────────────────────────────────────
 
 function Label({ text }: { text: string }) {
@@ -228,41 +288,117 @@ function Label({ text }: { text: string }) {
 }
 
 function NextBtn({ onPress, disabled, label = 'Continue' }: { onPress: () => void; disabled?: boolean; label?: string }) {
+  const { scale, onPressIn, onPressOut } = usePressScale();
   return (
-    <Pressable onPress={onPress} disabled={disabled}
-      style={({ pressed }) => [styles.nextBtn, disabled && styles.nextBtnOff, pressed && { opacity: 0.7 }]}>
+    <AnimatedPressableBase onPress={onPress} onPressIn={onPressIn} onPressOut={onPressOut} disabled={disabled}
+      style={[styles.nextBtn, disabled && styles.nextBtnOff, { transform: [{ scale }] }]}>
       <Text style={[styles.nextBtnText, disabled && styles.nextBtnTextOff]}>{label}</Text>
-    </Pressable>
+    </AnimatedPressableBase>
   );
 }
 
 function SkipBtn({ onPress, label }: { onPress: () => void; label: string }) {
+  const { scale, onPressIn, onPressOut } = usePressScale();
   return (
-    <Pressable onPress={onPress} style={({ pressed }) => [styles.skipBtn, pressed && { opacity: 0.6 }]}>
+    <AnimatedPressableBase onPress={onPress} onPressIn={onPressIn} onPressOut={onPressOut}
+      style={[styles.skipBtn, { transform: [{ scale }] }]}>
       <Text style={styles.skipBtnText}>{label}</Text>
-    </Pressable>
+    </AnimatedPressableBase>
   );
 }
 
+// Selecting a Chip cross-fades its fill (150ms) instead of snapping — and
+// like every other control here, presses get the same 0.97 tactile scale.
+// The scale (native driver — transform) and the fill (JS driver —
+// background/border/text color aren't native-animatable) are on two
+// DIFFERENT Animated.Values, but React Native still requires them to live
+// on separate style objects: a native-driven and a JS-driven animated value
+// in the SAME component's style throws "Attempting to run JS driver
+// animation on animated node that has been moved to native". So the scale
+// goes on an outer wrapper and the color fill on the inner Pressable.
 function Chip({ label, active, onPress }: { label: string; active: boolean; onPress: () => void }) {
+  const { scale, onPressIn, onPressOut } = usePressScale();
+  const fill = useFillAnim(active);
+  const backgroundColor = fill.interpolate({ inputRange: [0, 1], outputRange: [C.backgroundElement, HERO_COLOR] });
+  const borderColor     = fill.interpolate({ inputRange: [0, 1], outputRange: [C.text, HERO_COLOR] });
+  const textColor       = fill.interpolate({ inputRange: [0, 1], outputRange: [C.text, C.background] });
   return (
-    <Pressable onPress={onPress}
-      style={({ pressed }) => [styles.chip, active && styles.chipActive, pressed && { opacity: 0.7 }]}>
-      <Text style={[styles.chipText, active && styles.chipTextActive]}>{label}</Text>
-    </Pressable>
+    <Animated.View style={{ transform: [{ scale }] }}>
+      <AnimatedPressableBase onPress={onPress} onPressIn={onPressIn} onPressOut={onPressOut}
+        style={[styles.chip, { backgroundColor, borderColor }]}>
+        <Animated.Text style={[styles.chipText, { color: textColor }]}>{label}</Animated.Text>
+      </AnimatedPressableBase>
+    </Animated.View>
   );
 }
 
+// A self-contained segmented control — its own rounded-rect border, both
+// options the same fixed width with identical padding so "BB" and "Chips"
+// don't visually lopside it, filled tint + cream text on whichever is
+// selected. The end segments carry their own matching corner radius rather
+// than depending on the container clipping them, so the selected fill sits
+// flush against the border with no gap or seam.
 function UnitToggle({ unit, onPress, accent }: { unit: 'BB' | 'Chips'; onPress: (u: 'BB' | 'Chips') => void; accent?: string }) {
   return (
     <View style={styles.unitToggle}>
-      {(['BB', 'Chips'] as const).map(u => (
+      {(['BB', 'Chips'] as const).map((u, i) => (
         <Pressable key={u} onPress={() => onPress(u)}
-          style={[styles.unitBtn, unit === u && { backgroundColor: accent ?? C.tint }]}>
+          style={[
+            styles.unitBtn,
+            i === 0 && styles.unitBtnFirst,
+            i === 1 && styles.unitBtnLast,
+            i === 1 && styles.unitBtnDivider,
+            unit === u && { backgroundColor: accent ?? C.tint },
+          ]}>
           <Text style={[styles.unitBtnText, unit === u && styles.unitBtnTextActive]}>{u}</Text>
         </Pressable>
       ))}
     </View>
+  );
+}
+
+// A numeric field with its own local text buffer so the user can freely
+// delete every character — including the last one — before typing a fresh
+// number. A plain controlled input bound straight to a parsed draft value
+// snaps back to the last valid digit the instant the field goes empty,
+// because an empty string never parses to a number worth committing; this
+// only syncs from `displayValue` while the field ISN'T focused, so mid-edit
+// text (including '') is never overwritten out from under the user.
+function BufferedNumInput({ displayValue, onChangeText, onBlurCommit, onFocusInput, onSubmit, inputAccessoryViewID, placeholder, style }: {
+  displayValue: string;
+  onChangeText: (text: string) => void;
+  onBlurCommit?: (text: string) => void;
+  onFocusInput?: () => void;
+  onSubmit?: () => void;
+  inputAccessoryViewID?: string;
+  placeholder?: string;
+  style?: object;
+}) {
+  const [text, setText] = useState(displayValue);
+  const focused = useRef(false);
+
+  useEffect(() => {
+    if (!focused.current) setText(displayValue);
+  }, [displayValue]);
+
+  return (
+    <TextInput
+      style={style ?? styles.numInput}
+      keyboardType="numeric"
+      selectTextOnFocus
+      value={focused.current ? text : displayValue}
+      onFocus={() => { focused.current = true; setText(displayValue); onFocusInput?.(); }}
+      onChangeText={(t) => { setText(t); onChangeText(t); }}
+      onBlur={() => { focused.current = false; onBlurCommit?.(text); }}
+      // Android's numeric keypad shows its own "done" key since it has no
+      // accessory-view mechanism; iOS's numeric keypad has neither, which is
+      // exactly what inputAccessoryViewID (wired by the caller) covers.
+      returnKeyType={onSubmit ? 'done' : undefined}
+      onSubmitEditing={onSubmit}
+      inputAccessoryViewID={inputAccessoryViewID}
+      placeholder={placeholder}
+      placeholderTextColor={C.textSecondary}
+    />
   );
 }
 
@@ -280,18 +416,23 @@ function fmtActionLabel(entry: ActionEntry): string {
   }
 }
 
+// Each row mounts fresh exactly once — the moment its action is committed
+// (the list is append-only within a street) — so a plain mount-triggered
+// FadeSlideIn is exactly "this pill just landed", not a re-render artifact.
 function ActionRow({ playerLabel, dotColor, entry }: { playerLabel: string; dotColor: string; entry: ActionEntry }) {
   const color = ACTION_COLORS[entry.action] ?? '#999';
   return (
-    <View style={styles.actionRow}>
-      <View style={styles.actionRowLeft}>
-        <View style={[styles.actorDot, { backgroundColor: dotColor }]} />
-        <Text style={styles.actorLabel} numberOfLines={1}>{playerLabel}</Text>
+    <FadeSlideIn duration={200} distance={16} axis="x">
+      <View style={styles.actionRow}>
+        <View style={styles.actionRowLeft}>
+          <View style={[styles.actorDot, { backgroundColor: dotColor }]} />
+          <Text style={styles.actorLabel} numberOfLines={1}>{playerLabel}</Text>
+        </View>
+        <View style={[styles.actionBadge, { borderColor: color }]}>
+          <Text style={[styles.actionBadgeText, { color }]}>{fmtActionLabel(entry)}</Text>
+        </View>
       </View>
-      <View style={[styles.actionBadge, { borderColor: color }]}>
-        <Text style={[styles.actionBadgeText, { color }]}>{fmtActionLabel(entry)}</Text>
-      </View>
-    </View>
+    </FadeSlideIn>
   );
 }
 
@@ -304,8 +445,8 @@ function StackBar({ actors, draft, street }: {
 }) {
   const labels = POSITION_LABELS[draft.playerCount] ?? [];
   const getPosLabel = (a: string) => {
-    if (a === 'hero') return labels[draft.heroSeat ?? 0] ?? 'Hero';
-    if (a.startsWith('villain')) { const vi = parseInt(a.replace('villain',''),10)-1; return labels[draft.villainSeats[vi]??0] ?? `V${vi+1}`; }
+    if (a === 'hero') return labels[draft.heroSeat ?? 0] ?? heroLabel(draft.heroName);
+    if (a.startsWith('villain')) { const vi = parseInt(a.replace('villain',''),10)-1; return labels[draft.villainSeats[vi]??0] ?? villainLabel(a, draft.villainNames); }
     return '?';
   };
   const dotColor = (a: string) => a === 'hero' ? HERO_COLOR : a.startsWith('villain') ? (VILLAIN_COLORS[parseInt(a.replace('villain',''),10)-1] ?? VILLAIN_COLORS[0]) : UNNAMED_COLOR;
@@ -355,11 +496,25 @@ function SidePotStrip({
   );
 }
 
+// Shown directly above the bet-sizing controls on every street so the pot is
+// visible at the exact moment a sizing decision is being made — updates live
+// off the same potBB the sizing math itself uses, and respects whichever
+// unit this hand is tracked in.
+function PotBadge({ potBB, draft }: { potBB: number; draft: HandDraft }) {
+  return (
+    <View style={styles.potBadge}>
+      <Text style={styles.potBadgeText}>Pot: {fmtDualAmount(potBB, draft)}</Text>
+    </View>
+  );
+}
+
 // ── Action Input ──────────────────────────────────────────────────────────────
 
 interface ActionInputProps {
   actor: string;
   posLabel: string;
+  heroName?: string;
+  villainName?: string;
   currentBetBB: number;
   potBB: number;
   stackBB: number;
@@ -367,6 +522,7 @@ interface ActionInputProps {
   investedBB: number;
   isPreflop: boolean;
   bigBlind: number;
+  gameType: HandDraft['gameType'];
   canRaise?: boolean;
   preSelectedAction?: AnyAction;
   initialSizingBB?: number;
@@ -378,8 +534,8 @@ interface ActionInputProps {
 }
 
 function ActionInput({
-  actor, posLabel, currentBetBB, potBB, stackBB, minRaiseBB,
-  investedBB, isPreflop, bigBlind, canRaise = true,
+  actor, posLabel, heroName, villainName, currentBetBB, potBB, stackBB, minRaiseBB,
+  investedBB, isPreflop, bigBlind, gameType, canRaise = true,
   preSelectedAction, initialSizingBB, onConfirm, onSizingChange, onSizingOpen,
 }: ActionInputProps) {
   const isHero    = actor === 'hero';
@@ -457,9 +613,7 @@ function ActionInput({
     onSizingChange?.(null);
   };
 
-  const displaySizing = sizeUnit === 'Chips' && bigBlind > 0
-    ? `${fmtSize(effectiveSizing * bigBlind)} chips`
-    : `${fmtSize(effectiveSizing)}BB`;
+  const displaySizing = fmtDualAmount(effectiveSizing, { stackUnit: sizeUnit, bigBlind, gameType });
 
   const quickCommit = (a: AnyAction) => {
     let sz = 0;
@@ -492,15 +646,17 @@ function ActionInput({
 
   const presets   = isPreflop ? preflopPresets : postflopPresets;
   const raiseLabel= isPreflop || currentBetBB > 0 ? 'Raise' : 'Bet';
-  const actorTitle= isHero ? `Hero · ${posLabel}` : isVillain ? `Villain ${vi + 1} · ${posLabel}` : posLabel;
+  const actorName = isHero ? (heroName ?? 'Hero') : isVillain ? (villainName ?? `Villain ${vi + 1}`) : posLabel;
+  // Whose turn it is needs to read at a glance — a clear, colour-coded
+  // label (green for Hero, the villain's own accent — red for Villain 1 —
+  // otherwise) right above the action buttons, but just a label, not a
+  // filled banner competing with the buttons below it for attention.
+  const turnLabel = `${actorName} (${posLabel})`;
   const preBtn = (a: AnyAction) => preSelectedAction === a ? { borderWidth: 2, borderColor: accent } : {};
 
   return (
     <View style={[styles.actionInput, { borderColor: accent }]}>
-      <View style={styles.actionInputHeader}>
-        <View style={[styles.actorDot, { backgroundColor: accent }]} />
-        <Text style={[styles.actionInputTitle, { color: accent }]}>{actorTitle}</Text>
-      </View>
+      <Text style={[styles.turnLabel, { color: accent }]} numberOfLines={1} adjustsFontSizeToFit>{turnLabel}</Text>
 
       <View style={styles.actionBtnsRow}>
         <Pressable onPress={() => quickCommit('fold')}
@@ -516,7 +672,11 @@ function ActionInput({
           : <Pressable onPress={() => quickCommit('call')}
               style={({ pressed }) => [styles.actionBtn, { borderColor: '#2E7D52' }, pressed && { backgroundColor: '#2E7D52' }, preBtn('call')]}>
               <Text style={styles.actionBtnText}>
-                {isCallAllin ? `Call All-In ${fmtSize(fullStack)}BB` : `Call ${fmtSize(callAmt)}BB`}
+                {/* Compact button — no room for the "(BB)" bracket, but
+                    still never a raw ≥1000 number. */}
+                {isCallAllin
+                  ? `Call All-In ${sizeUnit === 'Chips' && bigBlind > 0 ? fmtCompact(fullStack * bigBlind) : `${fmtSize(fullStack)}BB`}`
+                  : `Call ${sizeUnit === 'Chips' && bigBlind > 0 ? fmtCompact(callAmt * bigBlind) : `${fmtSize(callAmt)}BB`}`}
               </Text>
             </Pressable>
         }
@@ -538,7 +698,9 @@ function ActionInput({
         <View style={{ gap: 8, marginTop: 2 }}>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 6 }}>
             {presets.map(({ label, sizeBB }) => {
-              const dispAmt = sizeUnit === 'Chips' && bigBlind > 0 ? fmtSize(sizeBB * bigBlind) : `${fmtSize(sizeBB)}BB`;
+              // Compact chip button — no room for the "(BB)" bracket, but
+              // still never a raw ≥1000 number.
+              const dispAmt = sizeUnit === 'Chips' && bigBlind > 0 ? fmtCompact(sizeBB * bigBlind) : `${fmtSize(sizeBB)}BB`;
               const isActive = !typedText && Math.abs(sizingBB - sizeBB) < 0.05;
               return (
                 <Pressable key={label} onPress={() => { updateSizing(sizeBB); setTypedText(''); }}
@@ -604,6 +766,23 @@ const STEP_TITLES: Record<number, string> = {
 };
 
 function StepHeader({ step, onBack, onClose }: { step: number; onBack: () => void; onClose: () => void }) {
+  // Step 1 has no Back button (it's the first screen) and its title is the
+  // screen's own big heading, not a small nav-bar caption — so instead of
+  // the centered title + reserved-but-empty back-button slot every other
+  // step uses, it gets the plain left-title/right-action row every other
+  // screen in the app uses (see Hands tab's own header for the same shape).
+  if (step === 1) {
+    return (
+      <View style={styles.header}>
+        <View style={styles.headerRowFlat}>
+          <Text style={styles.headerTitleLarge}>{STEP_TITLES[1]}</Text>
+          <Pressable onPress={onClose} style={({ pressed }) => [styles.closeBtn, pressed && { opacity: 0.6 }]}>
+            <Text style={styles.closeIcon}>✕</Text>
+          </Pressable>
+        </View>
+      </View>
+    );
+  }
   return (
     <View style={styles.header}>
       <View style={styles.headerRow}>
@@ -638,32 +817,92 @@ interface StepProps { draft: HandDraft; set: (u: Partial<HandDraft>) => void; on
 
 // ── Step 1: Game Type ─────────────────────────────────────────────────────────
 
-// Full-screen picker — two large bordered buttons filling almost the whole
-// screen. A single tap on either is the whole decision — it selects and
-// immediately advances, no separate confirm step.
+// Reserved space below the cards for the Continue button — it's ALWAYS
+// occupied (the button just fades/slides in or out inside it), so the cards
+// above never resize depending on whether a selection has been made.
+const GAME_TYPE_CONTINUE_SLOT = 52;
+const GAME_TYPE_GAP = 16;
+
+// One Cash/Tournament card — press-scale feedback plus a 150ms cross-fade
+// into the green fill when selected, instead of an instant color snap.
+// Same split as Chip above: the native-driven press scale lives on an outer
+// wrapper, the JS-driven color fill on the inner Pressable — mixing the two
+// drivers in one style object is what threw "Attempting to run JS driver
+// animation on animated node that has been moved to native" when a card
+// was selected. `styles.gameTypeBtn` (including its flex: 1) moves to the
+// inner element; the outer wrapper just needs flex: 1 too so it still
+// claims its half of the row.
+function GameTypeCard({ label, selected, onSelect }: { label: string; selected: boolean; onSelect: () => void }) {
+  const { scale, onPressIn, onPressOut } = usePressScale();
+  const fill = useFillAnim(selected);
+  const backgroundColor = fill.interpolate({ inputRange: [0, 1], outputRange: [C.background, HERO_COLOR] });
+  const textColor       = fill.interpolate({ inputRange: [0, 1], outputRange: [C.text, C.tintText] });
+  return (
+    <Animated.View style={{ flex: 1, transform: [{ scale }] }}>
+      <AnimatedPressableBase
+        onPressIn={() => { onSelect(); onPressIn(); }}
+        onPressOut={onPressOut}
+        style={[styles.gameTypeBtn, { backgroundColor }]}>
+        <Animated.Text style={[styles.gameTypeBtnText, { color: textColor }]}>{label}</Animated.Text>
+      </AnimatedPressableBase>
+    </Animated.View>
+  );
+}
+
+// Full-screen picker — two large, identically-bordered cards filling almost
+// the whole screen. Tapping a card selects it (and can be changed by
+// tapping the other one); Continue is what actually commits and advances.
 function StepGameType({ set, onNext }: StepProps) {
   const { height } = useWindowDimensions();
+  const [selected, setSelected] = useState<'cash' | 'tournament' | null>(null);
+  const [advancing, setAdvancing] = useState(false);
+  // The screen fade IS the transition — plays once Continue is pressed, so
+  // it reads as "moving to the next screen" rather than a button effect.
+  const screenFade = useRef(new Animated.Value(1)).current;
+  const continueAnim = useRef(new Animated.Value(0)).current;
 
-  const pick = (type: 'cash' | 'tournament') => {
-    if (type === 'cash') {
+  useEffect(() => {
+    Animated.timing(continueAnim, {
+      toValue: selected ? 1 : 0,
+      duration: 200,
+      easing: Easing.out(Easing.ease),
+      useNativeDriver: true,
+    }).start();
+  }, [selected, continueAnim]);
+
+  const handleContinue = () => {
+    if (!selected || advancing) return;
+    setAdvancing(true);
+    if (selected === 'cash') {
       set({ gameType: 'cash', stackUnit: '$', bigBlind: INITIAL_DRAFT.cashBB, smallBlind: INITIAL_DRAFT.cashSB });
     } else {
       set({ gameType: 'tournament', stackUnit: 'Chips', bigBlind: INITIAL_DRAFT.tournamentBB, smallBlind: INITIAL_DRAFT.tournamentSB });
     }
-    onNext();
+    Animated.timing(screenFade, { toValue: 0, duration: 230, easing: Easing.out(Easing.ease), useNativeDriver: true })
+      .start(() => onNext());
   };
 
+  // Fixed height, not flex:1 — the cards row's size depends only on the
+  // screen height, never on whether the Continue slot below it currently
+  // has anything visible in it.
+  const totalHeight = Math.max(460, height * 0.7);
+  const cardsHeight = totalHeight - GAME_TYPE_GAP - GAME_TYPE_CONTINUE_SLOT;
+
   return (
-    <View style={[styles.gameTypeScreen, { height: Math.max(400, height * 0.65) }]}>
-      <Pressable onPress={() => pick('cash')}
-        style={({ pressed }) => [styles.gameTypeBtn, pressed && { opacity: 0.85 }]}>
-        <Text style={styles.gameTypeBtnText}>Cash Game</Text>
-      </Pressable>
-      <Pressable onPress={() => pick('tournament')}
-        style={({ pressed }) => [styles.gameTypeBtn, pressed && { opacity: 0.85 }]}>
-        <Text style={styles.gameTypeBtnText}>Tournament</Text>
-      </Pressable>
-    </View>
+    <Animated.View style={[styles.gameTypeRoot, { minHeight: totalHeight, opacity: screenFade }]}>
+      <View style={[styles.gameTypeScreen, { height: cardsHeight }]}>
+        <GameTypeCard label="Cash Game" selected={selected === 'cash'} onSelect={() => setSelected('cash')} />
+        <GameTypeCard label="Tournament" selected={selected === 'tournament'} onSelect={() => setSelected('tournament')} />
+      </View>
+      <View style={[styles.gameTypeContinueSlot, { height: GAME_TYPE_CONTINUE_SLOT }]} pointerEvents={selected ? 'auto' : 'none'}>
+        <Animated.View style={{
+          opacity: continueAnim,
+          transform: [{ translateY: continueAnim.interpolate({ inputRange: [0, 1], outputRange: [16, 0] }) }],
+        }}>
+          <NextBtn onPress={handleContinue} disabled={!selected || advancing} />
+        </Animated.View>
+      </View>
+    </Animated.View>
   );
 }
 
@@ -674,11 +913,126 @@ const CASH_PRESETS = [
   { label: '$2/$5', sb: 2, bb: 5 }, { label: '$5/$10', sb: 5, bb: 10 },
 ];
 
-function StepBlinds({ draft, set, onNext }: StepProps) {
+const AnimatedPath = Animated.createAnimatedComponent(Path);
+const INTRO_DRAW_MS = 500;
+const INTRO_DRAW_STROKE = 2.5;
+const INTRO_DRAW_RADIUS = 12;
+
+// An explicit path (rather than a <Rect rx=.../>, whose corner-rounding
+// implementation — and therefore its implicit start point/winding — isn't
+// guaranteed consistent across react-native-svg's iOS/Android renderers) so
+// the draw is guaranteed to start at the top-left corner and trace clockwise:
+// right across the top, down the right side, left across the bottom, up the
+// left side, closing back at the top-left corner.
+function topLeftClockwiseRectPath(x: number, y: number, w: number, h: number, r: number) {
+  return `M ${x + r},${y} H ${x + w - r} A ${r},${r} 0 0 1 ${x + w},${y + r} V ${y + h - r} A ${r},${r} 0 0 1 ${x + w - r},${y + h} H ${x + r} A ${r},${r} 0 0 1 ${x},${y + h - r} V ${y + r} A ${r},${r} 0 0 1 ${x + r},${y} Z`;
+}
+
+// Wraps one input group with the static "this is the active section"
+// outline — same solid-border-plus-tint treatment as the Position screen's
+// Hero/Villain selectors, moving between groups instead of between two
+// fixed selectors. No continuous animation.
+//
+// `introDraw`, when true, replaces that static border for its first
+// appearance with a pen-drawing effect: an SVG path stroke traced clockwise
+// from the top-left corner via strokeDashoffset, over INTRO_DRAW_MS. Once
+// the stroke completes, the SVG unmounts and the plain CSS border (already
+// governed by `active`) takes over — no looping, drawn once per mount.
+function HighlightGroup({ active, children, introDraw }: { active: boolean; children: ReactNode; introDraw?: boolean }) {
+  const [size, setSize] = useState({ width: 0, height: 0 });
+  const [drawing, setDrawing] = useState(!!introDraw);
+  const draw = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (!introDraw) return;
+    Animated.timing(draw, { toValue: 1, duration: INTRO_DRAW_MS, easing: Easing.inOut(Easing.ease), useNativeDriver: false })
+      .start(() => setDrawing(false));
+    // Intentionally empty deps — this is a one-shot "screen just loaded" cue,
+    // not something that should replay on later re-renders.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const w = Math.max(size.width - INTRO_DRAW_STROKE, 0);
+  const h = Math.max(size.height - INTRO_DRAW_STROKE, 0);
+  const r = Math.min(INTRO_DRAW_RADIUS, w / 2, h / 2);
+  // Perimeter = the four straight edges (each shortened by the two corner
+  // radii it meets) plus the four corner arcs, which together make one full
+  // circle of radius r.
+  const perimeter = Math.max(2 * (w - 2 * r) + 2 * (h - 2 * r) + 2 * Math.PI * r, 0);
+  const dashOffset = draw.interpolate({ inputRange: [0, 1], outputRange: [perimeter, 0] });
+  const d = topLeftClockwiseRectPath(INTRO_DRAW_STROKE / 2, INTRO_DRAW_STROKE / 2, w, h, r);
+
+  return (
+    <View style={[styles.highlightWrap, sectionHighlightStyle(active && !drawing)]}
+      onLayout={(e) => setSize({ width: e.nativeEvent.layout.width, height: e.nativeEvent.layout.height })}>
+      {children}
+      {drawing && size.width > 0 && (
+        <Svg pointerEvents="none" style={StyleSheet.absoluteFillObject} width={size.width} height={size.height}>
+          <AnimatedPath
+            d={d} fill="none" stroke={HERO_COLOR} strokeWidth={INTRO_DRAW_STROKE} strokeLinecap="round"
+            strokeDasharray={`${perimeter}, ${perimeter}`}
+            strokeDashoffset={dashOffset}
+          />
+        </Svg>
+      )}
+    </View>
+  );
+}
+
+// A pill-shaped "Confirm" button styled to match the app (dark green fill,
+// cream text) rather than a bare default-looking iOS toolbar link — sitting
+// right-aligned in a keyboard accessory bar above the numeric pad.
+function ConfirmKeyboardAccessory({ nativeID, disabled, onPress }: { nativeID: string; disabled: boolean; onPress: () => void }) {
+  return (
+    <InputAccessoryView nativeID={nativeID}>
+      <View style={styles.kbToolbar}>
+        <Pressable onPress={onPress} disabled={disabled} hitSlop={8}
+          style={({ pressed }) => [styles.kbToolbarBtn, disabled && styles.kbToolbarBtnOff, pressed && !disabled && styles.kbToolbarBtnPressed]}>
+          <Text style={[styles.kbToolbarText, disabled && styles.kbToolbarTextOff]}>Confirm</Text>
+        </Pressable>
+      </View>
+    </InputAccessoryView>
+  );
+}
+
+function StepBlinds({ draft, set, onNext, onFieldFocus }: StepProps & { onFieldFocus?: () => void }) {
   const isCash = draft.gameType === 'cash';
   const [stackUnit, setStackUnit] = useState<'BB' | 'Chips'>('BB');
   const [stackText, setStackText] = useState('');
   const stackFocused = useRef(false);
+
+  // The highlight walks 1 Players → 2 Blinds/Stakes → 3 Ante/Straddle →
+  // 4 Effective Stack, then 5 (nowhere — all done). HandDraft's defaults are
+  // already non-zero (playerCount 6, blinds 100/200, etc.), so "does this
+  // field have a value" can't signal completion the way it does elsewhere in
+  // the flow — each group only advances once the user actually acts on it.
+  // Re-mounting this step (jumping back to edit, or reopening a saved hand)
+  // shouldn't replay the walk-through — draft.blindsStepSeen (or having
+  // reached any later street, for hands saved before that field existed) is
+  // what tells the two cases apart.
+  const alreadySeen = draft.blindsStepSeen || draft.preflopComplete
+    || draft.flopComplete || draft.turnComplete || draft.riverComplete;
+  const [highlightStep, setHighlightStep] = useState(alreadySeen ? 5 : 1);
+  const advance = (n: number) => {
+    setHighlightStep(s => Math.max(s, n));
+    if (n >= 5) set({ blindsStepSeen: true });
+  };
+
+  // Players and Ante both default to a non-empty HandDraft value
+  // (playerCount 6, anteType 'none') that would otherwise show a chip as
+  // pre-selected before the user has actually tapped anything. These flip
+  // true only on an explicit tap, so a fresh hand starts with every chip in
+  // both rows unselected; reopening an already-completed hand starts both
+  // true so the real saved selection displays correctly.
+  const [playersChosen, setPlayersChosen] = useState(alreadySeen);
+  const [anteChosen, setAnteChosen] = useState(alreadySeen);
+  // Confirming the Blind Level lives entirely in the keyboard's accessory
+  // toolbar (see ConfirmKeyboardAccessory above) instead of an inline
+  // button, so it never occupies screen space of its own — it only exists
+  // while the SB/BB keyboard is up, and "tapping back in" to either field to
+  // edit an already-confirmed value re-opens that same keyboard/toolbar for
+  // free.
+  const confirmBlinds = () => { Keyboard.dismiss(); advance(3); };
 
   const getDisplayStack = () => {
     if (stackFocused.current) return stackText;
@@ -707,22 +1061,33 @@ function StepBlinds({ draft, set, onNext }: StepProps) {
 
   const stackNote = () => {
     if (draft.effectiveStack <= 0 || draft.bigBlind <= 0) return '';
+    const raw = draft.effectiveStack * draft.bigBlind;
     return stackUnit === 'BB'
-      ? `= ${fmtSize(draft.effectiveStack * draft.bigBlind)} ${isCash ? '$' : 'chips'}`
-      : `= ${fmtSize(draft.effectiveStack)} BB`;
+      ? `= ${isCash ? `$${fmtCompact(raw)}` : fmtCompact(raw)}`
+      : `= ${fmtSize(draft.effectiveStack)}BB`;
   };
 
   const isOther = isCash && !CASH_PRESETS.find(p => p.label === draft.stakes);
 
   return (
     <StepScroll>
+      <HighlightGroup active={highlightStep === 1} introDraw={!alreadySeen}>
+        <Label text="Players at table" />
+        <View style={styles.chipRow}>
+          {[2, 3, 4, 5, 6, 7, 8, 9].map(n => (
+            <Chip key={n} label={String(n)} active={playersChosen && draft.playerCount === n}
+              onPress={() => { set({ playerCount: n }); setPlayersChosen(true); advance(2); }} />
+          ))}
+        </View>
+      </HighlightGroup>
+
       {isCash ? (
-        <>
+        <HighlightGroup active={highlightStep === 2}>
           <Label text="Stakes" />
           <View style={styles.chipRow}>
             {CASH_PRESETS.map(({ label, sb, bb }) => (
               <Chip key={label} label={label} active={draft.stakes === label}
-                onPress={() => set({ stakes: label, cashSB: sb, cashBB: bb, bigBlind: bb, smallBlind: sb })} />
+                onPress={() => { set({ stakes: label, cashSB: sb, cashBB: bb, bigBlind: bb, smallBlind: sb }); advance(3); }} />
             ))}
             <Chip label="Other" active={isOther} onPress={() => set({ stakes: 'other' })} />
           </View>
@@ -731,105 +1096,143 @@ function StepBlinds({ draft, set, onNext }: StepProps) {
               <View style={{ flex: 1, gap: 4 }}>
                 <Text style={styles.fieldLabel}>Small Blind ($)</Text>
                 <View style={styles.numRow}>
-                  <TextInput style={styles.numInput} keyboardType="numeric" selectTextOnFocus
-                    value={draft.cashSB > 0 ? String(draft.cashSB) : ''}
-                    onChangeText={(t) => { const n = parseFloat(t); if (!isNaN(n)) set({ cashSB: n, smallBlind: n }); }}
-                    placeholder="1" placeholderTextColor={C.textSecondary} />
+                  <BufferedNumInput
+                    displayValue={draft.cashSB > 0 ? String(draft.cashSB) : ''}
+                    // Auto-fill the Big Blind at double the Small Blind — it's
+                    // still its own independent field the user can overwrite.
+                    onChangeText={(t) => { const n = parseFloat(t); if (!isNaN(n)) set({ cashSB: n, smallBlind: n, cashBB: n * 2, bigBlind: n * 2 }); }}
+                    onBlurCommit={() => { if (draft.cashSB > 0 && draft.cashBB > 0) advance(3); }}
+                    onFocusInput={onFieldFocus}
+                    placeholder="1" />
                 </View>
               </View>
               <View style={{ flex: 1, gap: 4 }}>
                 <Text style={styles.fieldLabel}>Big Blind ($)</Text>
                 <View style={styles.numRow}>
-                  <TextInput style={styles.numInput} keyboardType="numeric" selectTextOnFocus
-                    value={draft.cashBB > 0 ? String(draft.cashBB) : ''}
+                  <BufferedNumInput
+                    displayValue={draft.cashBB > 0 ? String(draft.cashBB) : ''}
                     onChangeText={(t) => { const n = parseFloat(t); if (!isNaN(n)) set({ cashBB: n, bigBlind: n }); }}
-                    placeholder="2" placeholderTextColor={C.textSecondary} />
+                    onBlurCommit={() => { if (draft.cashSB > 0 && draft.cashBB > 0) advance(3); }}
+                    onFocusInput={onFieldFocus}
+                    placeholder="2" />
                 </View>
               </View>
             </View>
           )}
-          <Label text="Straddle" />
-          <View style={styles.chipRow}>
-            <Chip label="No Straddle" active={!draft.straddleEnabled}
-              onPress={() => set({ straddleEnabled: false, straddleAmount: 0 })} />
-            <Chip label="Straddle 2×" active={draft.straddleEnabled}
-              onPress={() => set({ straddleEnabled: true, straddleAmount: draft.bigBlind * 2 })} />
-          </View>
-        </>
+        </HighlightGroup>
       ) : (
-        <>
+        <HighlightGroup active={highlightStep === 2}>
           <Label text="Blind level" />
           <View style={styles.twoCol}>
             <View style={{ flex: 1, gap: 4 }}>
-              <Text style={styles.fieldLabel}>Small Blind (chips)</Text>
+              <Text style={styles.fieldLabel}>Small Blind</Text>
               <View style={styles.numRow}>
-                <TextInput style={styles.numInput} keyboardType="numeric" selectTextOnFocus
-                  value={draft.tournamentSB > 0 ? String(draft.tournamentSB) : ''}
-                  onChangeText={(t) => { const n = parseFloat(t); if (!isNaN(n)) set({ tournamentSB: n, smallBlind: n }); }}
-                  placeholder="100" placeholderTextColor={C.textSecondary} />
+                <BufferedNumInput
+                  displayValue={draft.tournamentSB > 0 ? String(draft.tournamentSB) : ''}
+                  // Auto-fill the Big Blind at double the Small Blind — it's
+                  // still its own independent field the user can overwrite.
+                  onChangeText={(t) => {
+                    const n = parseFloat(t);
+                    if (!isNaN(n)) set({ tournamentSB: n, smallBlind: n, tournamentBB: n * 2, bigBlind: n * 2, stakes: `${n}/${n * 2}` });
+                  }}
+                  onSubmit={confirmBlinds}
+                  inputAccessoryViewID={Platform.OS === 'ios' ? BLINDS_SB_ACCESSORY_ID : undefined}
+                  onFocusInput={onFieldFocus}
+                  placeholder="100" />
               </View>
             </View>
             <View style={{ flex: 1, gap: 4 }}>
-              <Text style={styles.fieldLabel}>Big Blind (chips)</Text>
+              <Text style={styles.fieldLabel}>Big Blind</Text>
               <View style={styles.numRow}>
-                <TextInput style={styles.numInput} keyboardType="numeric" selectTextOnFocus
-                  value={draft.tournamentBB > 0 ? String(draft.tournamentBB) : ''}
+                <BufferedNumInput
+                  displayValue={draft.tournamentBB > 0 ? String(draft.tournamentBB) : ''}
                   onChangeText={(t) => { const n = parseFloat(t); if (!isNaN(n)) set({ tournamentBB: n, bigBlind: n, stakes: `${draft.tournamentSB}/${n}` }); }}
-                  placeholder="200" placeholderTextColor={C.textSecondary} />
+                  onSubmit={confirmBlinds}
+                  inputAccessoryViewID={Platform.OS === 'ios' ? BLINDS_BB_ACCESSORY_ID : undefined}
+                  onFocusInput={onFieldFocus}
+                  placeholder="200" />
               </View>
             </View>
           </View>
-          <Label text="Ante" />
-          <View style={styles.chipRow}>
-            {([['none', 'No Ante'], ['ante', 'Ante'], ['bbAnte', 'BB Ante']] as [AnteType, string][]).map(([key, lbl]) => (
-              <Chip key={key} label={lbl} active={draft.anteType === key}
-                onPress={() => set({ anteType: key, anteAmount: key === 'bbAnte' ? draft.tournamentBB : key === 'none' ? 0 : draft.anteAmount })} />
-            ))}
-          </View>
-          {draft.anteType === 'ante' && (
-            <View style={{ gap: 4 }}>
-              <Text style={styles.fieldLabel}>Ante amount (chips)</Text>
-              <View style={styles.numRow}>
-                <TextInput style={styles.numInput} keyboardType="numeric" selectTextOnFocus
-                  value={draft.anteAmount > 0 ? String(draft.anteAmount) : ''}
-                  onChangeText={(t) => { const n = parseFloat(t); if (!isNaN(n)) set({ anteAmount: n }); }}
-                  placeholder="25" placeholderTextColor={C.textSecondary} />
-              </View>
-            </View>
+          {Platform.OS === 'ios' && (
+            <>
+              <ConfirmKeyboardAccessory nativeID={BLINDS_SB_ACCESSORY_ID}
+                disabled={!(draft.tournamentSB > 0 && draft.tournamentBB > 0)} onPress={confirmBlinds} />
+              <ConfirmKeyboardAccessory nativeID={BLINDS_BB_ACCESSORY_ID}
+                disabled={!(draft.tournamentSB > 0 && draft.tournamentBB > 0)} onPress={confirmBlinds} />
+            </>
           )}
-        </>
+        </HighlightGroup>
       )}
 
-      <Label text="Players at table" />
-      <View style={styles.chipRow}>
-        {[2, 3, 4, 5, 6, 7, 8, 9].map(n => (
-          <Chip key={n} label={String(n)} active={draft.playerCount === n} onPress={() => set({ playerCount: n })} />
-        ))}
-      </View>
+      <HighlightGroup active={highlightStep === 3}>
+        {isCash ? (
+          <>
+            <Label text="Straddle" />
+            <View style={styles.chipRow}>
+              <Chip label="No Straddle" active={!draft.straddleEnabled}
+                onPress={() => { set({ straddleEnabled: false, straddleAmount: 0 }); advance(4); }} />
+              <Chip label="Straddle 2×" active={draft.straddleEnabled}
+                onPress={() => { set({ straddleEnabled: true, straddleAmount: draft.bigBlind * 2 }); advance(4); }} />
+            </View>
+          </>
+        ) : (
+          <>
+            <Label text="Ante" />
+            <View style={styles.chipRow}>
+              {([['none', 'No Ante'], ['bbAnte', 'BB Ante'], ['ante', 'Ante']] as [AnteType, string][]).map(([key, lbl]) => (
+                <Chip key={key} label={lbl} active={anteChosen && draft.anteType === key}
+                  onPress={() => {
+                    set({ anteType: key, anteAmount: key === 'bbAnte' ? draft.tournamentBB : key === 'none' ? 0 : draft.anteAmount });
+                    setAnteChosen(true);
+                    // No Ante / BB Ante need nothing further from the user —
+                    // advance right away. Ante needs the amount typed in
+                    // first, so the highlight waits for that field's blur.
+                    if (key !== 'ante') advance(4);
+                  }} />
+              ))}
+            </View>
+            {draft.anteType === 'ante' && (
+              <View style={{ gap: 4 }}>
+                <Text style={styles.fieldLabel}>Ante amount</Text>
+                <View style={styles.numRow}>
+                  <BufferedNumInput
+                    displayValue={draft.anteAmount > 0 ? String(draft.anteAmount) : ''}
+                    onChangeText={(t) => { const n = parseFloat(t); if (!isNaN(n)) set({ anteAmount: n }); }}
+                    onBlurCommit={() => { if (draft.anteAmount > 0) advance(4); }}
+                    placeholder="25" />
+                </View>
+              </View>
+            )}
+          </>
+        )}
+      </HighlightGroup>
 
-      <Label text="Effective stack" />
-      <View style={styles.numRow}>
-        <TextInput
-          style={styles.numInput}
-          keyboardType="numeric"
-          selectTextOnFocus
-          value={getDisplayStack()}
-          onFocus={() => { stackFocused.current = true; setStackText(getDisplayStack()); }}
-          onChangeText={(t) => {
-            setStackText(t);
-            const n = parseFloat(t);
-            if (!isNaN(n) && n > 0) {
-              const bb = stackUnit === 'Chips' && draft.bigBlind > 0 ? n / draft.bigBlind : n;
-              set({ effectiveStack: bb, effectiveStackBB: bb });
-            }
-          }}
-          onBlur={() => { stackFocused.current = false; commitStack(stackText, stackUnit); }}
-          placeholder={stackUnit === 'BB' ? '100' : String(Math.round((draft.bigBlind || 2) * 100))}
-          placeholderTextColor={C.textSecondary}
-        />
-        <UnitToggle unit={stackUnit} onPress={handleUnitChange} />
-      </View>
-      {stackNote() ? <Text style={styles.stackNote}>{stackNote()}</Text> : null}
+      <HighlightGroup active={highlightStep === 4}>
+        <Label text="Effective stack" />
+        <View style={styles.numRow}>
+          <TextInput
+            style={styles.numInput}
+            keyboardType="numeric"
+            selectTextOnFocus
+            value={getDisplayStack()}
+            onFocus={() => { stackFocused.current = true; setStackText(getDisplayStack()); }}
+            onChangeText={(t) => {
+              setStackText(t);
+              const n = parseFloat(t);
+              if (!isNaN(n) && n > 0) {
+                const bb = stackUnit === 'Chips' && draft.bigBlind > 0 ? n / draft.bigBlind : n;
+                set({ effectiveStack: bb, effectiveStackBB: bb });
+              }
+            }}
+            onBlur={() => { stackFocused.current = false; commitStack(stackText, stackUnit); advance(5); }}
+            placeholder={stackUnit === 'BB' ? '100' : String(Math.round((draft.bigBlind || 2) * 100))}
+            placeholderTextColor={C.textSecondary}
+          />
+          <UnitToggle unit={stackUnit} onPress={handleUnitChange} />
+        </View>
+        {stackNote() ? <Text style={styles.stackNote}>{stackNote()}</Text> : null}
+      </HighlightGroup>
 
       <NextBtn onPress={onNext} disabled={draft.bigBlind <= 0 || draft.effectiveStack <= 0} />
     </StepScroll>
@@ -850,10 +1253,68 @@ function StepPosition({ draft, set, onNext }: StepProps) {
     if (draft.villainSeats.length === 0) set({ villainSeats: [-1] });
   }, []);
 
+  // Continue is always pressable (never greyed out) — pressing it with a
+  // seat missing doesn't navigate, it just makes the gap impossible to miss:
+  // a short vibration plus 3 quick pulses of the missing box's border. No
+  // error text needed on top of that.
+  const heroPulse    = useRef(new Animated.Value(0)).current;
+  const villainPulse = useRef(new Animated.Value(0)).current;
+  const pulse = (val: Animated.Value) => {
+    val.setValue(0);
+    Animated.sequence([
+      Animated.timing(val, { toValue: 1, duration: 110, useNativeDriver: true }),
+      Animated.timing(val, { toValue: 0, duration: 110, useNativeDriver: true }),
+      Animated.timing(val, { toValue: 1, duration: 110, useNativeDriver: true }),
+      Animated.timing(val, { toValue: 0, duration: 110, useNativeDriver: true }),
+      Animated.timing(val, { toValue: 1, duration: 110, useNativeDriver: true }),
+      Animated.timing(val, { toValue: 0, duration: 180, useNativeDriver: true }),
+    ]).start();
+  };
+
+  const handleContinue = () => {
+    const heroMissing    = draft.heroSeat === null;
+    const villainMissing = !draft.villainSeats.some(s => s >= 0);
+    if (!heroMissing && !villainMissing) { onNext(); return; }
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    if (heroMissing) pulse(heroPulse);
+    if (villainMissing) pulse(villainPulse);
+  };
+
+  // Each villain's name/stack is keyed by its CURRENT position in
+  // villainSeats ('villain1' = index 0, etc.), not a stable per-villain id —
+  // so whenever a villain slot is removed from the middle of the array
+  // (explicit remove, or Hero's seat bumping a villain out), everything
+  // after it has to be re-keyed down one slot too. Skipping this is exactly
+  // what makes one villain's name appear to "jump" onto another villain
+  // after a removal — the data was never touched, just left under its old
+  // (now wrong) index.
+  const reindexAfterRemove = <T,>(map: Record<string, T>, removedIdx: number, count: number): Record<string, T> => {
+    const out: Record<string, T> = {};
+    for (let i = 0; i < count; i++) {
+      if (i === removedIdx) continue;
+      const oldKey = `villain${i + 1}`;
+      if (!(oldKey in map)) continue;
+      const newKey = i < removedIdx ? oldKey : `villain${i}`;
+      out[newKey] = map[oldKey];
+    }
+    return out;
+  };
+
   const handleSeat = (seatIdx: number) => {
     if (!mode) return;
     if (mode === 'hero') {
-      set({ heroSeat: seatIdx, villainSeats: draft.villainSeats.filter(s => s !== seatIdx) });
+      const bumpedIdx = draft.villainSeats.indexOf(seatIdx);
+      if (bumpedIdx === -1) {
+        set({ heroSeat: seatIdx });
+      } else {
+        const count = draft.villainSeats.length;
+        set({
+          heroSeat: seatIdx,
+          villainSeats: draft.villainSeats.filter(s => s !== seatIdx),
+          villainStacksBB: reindexAfterRemove(draft.villainStacksBB, bumpedIdx, count),
+          villainNames: reindexAfterRemove(draft.villainNames, bumpedIdx, count),
+        });
+      }
       // Seamless flow: arm Villain 1 immediately so the very next table tap
       // places the villain — no need to manually tap the Villain 1 box first.
       setMode('villain0');
@@ -895,9 +1356,12 @@ function StepPosition({ draft, set, onNext }: StepProps) {
   const removeVillain = (i: number) => {
     // There must always be at least one villain box on screen.
     if (draft.villainSeats.length <= 1) return;
-    const stacks = { ...draft.villainStacksBB };
-    delete stacks[`villain${i + 1}`];
-    set({ villainSeats: draft.villainSeats.filter((_, idx) => idx !== i), villainStacksBB: stacks });
+    const count = draft.villainSeats.length;
+    set({
+      villainSeats: draft.villainSeats.filter((_, idx) => idx !== i),
+      villainStacksBB: reindexAfterRemove(draft.villainStacksBB, i, count),
+      villainNames: reindexAfterRemove(draft.villainNames, i, count),
+    });
     if (mode === `villain${i}`) setMode(null);
   };
 
@@ -924,11 +1388,20 @@ function StepPosition({ draft, set, onNext }: StepProps) {
           style={[styles.selectorBtn, glowStyle(HERO_COLOR, mode === 'hero')]}>
           <View style={[styles.selectorDot, { backgroundColor: HERO_COLOR }]} />
           <View style={{ flex: 1 }}>
-            <Text style={[styles.selectorTitle, { color: HERO_COLOR }]}>Hero</Text>
+            <Text style={[styles.selectorTitle, { color: HERO_COLOR }]}>{heroLabel(draft.heroName)}</Text>
             <Text style={styles.selectorSeat}>{draft.heroSeat !== null ? labels[draft.heroSeat] ?? '?' : 'Tap to select seat'}</Text>
           </View>
           <Text style={[styles.selectorArrow, mode === 'hero' && { color: HERO_COLOR }]}>{mode === 'hero' ? '▲' : '›'}</Text>
+          <Animated.View pointerEvents="none" style={[styles.pulseOverlay, { opacity: heroPulse }]} />
         </Pressable>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingLeft: 2 }}>
+          <Text style={styles.vstackLabel}>Name</Text>
+          <TextInput style={styles.villainNameInput}
+            value={draft.heroName}
+            onChangeText={(t) => set({ heroName: t })}
+            placeholder="Hero (optional)" placeholderTextColor={C.textSecondary}
+            maxLength={20} returnKeyType="done" />
+        </View>
 
         {draft.villainSeats.map((seat, i) => {
           const isActive = mode === `villain${i}`;
@@ -943,10 +1416,11 @@ function StepPosition({ draft, set, onNext }: StepProps) {
                   style={[styles.selectorBtn, { flex: 1 }, glowStyle(color, isActive)]}>
                   <View style={[styles.selectorDot, { backgroundColor: color }]} />
                   <View style={{ flex: 1 }}>
-                    <Text style={[styles.selectorTitle, { color }]}>Villain {i + 1}</Text>
+                    <Text style={[styles.selectorTitle, { color }]}>{villainLabel(vKey, draft.villainNames)}</Text>
                     <Text style={styles.selectorSeat}>{seat >= 0 ? (labels[seat] ?? '?') : 'Tap to select seat'}</Text>
                   </View>
                   <Text style={[styles.selectorArrow, isActive && { color }]}>{isActive ? '▲' : '›'}</Text>
+                  <Animated.View pointerEvents="none" style={[styles.pulseOverlay, { opacity: villainPulse }]} />
                 </Pressable>
                 {draft.villainSeats.length > 1 && (
                   <Pressable onPress={() => removeVillain(i)}
@@ -956,10 +1430,18 @@ function StepPosition({ draft, set, onNext }: StepProps) {
                 )}
               </View>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingLeft: 2 }}>
-                <Text style={styles.vstackLabel}>V{i + 1} stack</Text>
+                <Text style={styles.vstackLabel}>Name</Text>
+                <TextInput style={styles.villainNameInput}
+                  value={draft.villainNames[vKey] ?? ''}
+                  onChangeText={(t) => set({ villainNames: { ...draft.villainNames, [vKey]: t } })}
+                  placeholder={`Villain ${i + 1} (optional)`} placeholderTextColor={C.textSecondary}
+                  maxLength={20} returnKeyType="done" />
+              </View>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingLeft: 2 }}>
+                <Text style={styles.vstackLabel}>Stack</Text>
                 <View style={[styles.numRow, { flex: 1 }]}>
-                  <TextInput style={styles.numInput} keyboardType="numeric" selectTextOnFocus
-                    value={stackBB > 0 ? dispStack : ''}
+                  <BufferedNumInput
+                    displayValue={stackBB > 0 ? dispStack : ''}
                     onChangeText={(t) => {
                       const n = parseFloat(t);
                       if (!isNaN(n)) {
@@ -967,7 +1449,7 @@ function StepPosition({ draft, set, onNext }: StepProps) {
                         set({ villainStacksBB: { ...draft.villainStacksBB, [vKey]: bb } });
                       }
                     }}
-                    placeholder={fmtSize(draft.effectiveStackBB || 100)} placeholderTextColor={C.textSecondary} />
+                    placeholder={fmtSize(draft.effectiveStackBB || 100)} />
                   <UnitToggle unit={vStackUnit} onPress={setVStackUnit} accent={color} />
                 </View>
               </View>
@@ -985,7 +1467,7 @@ function StepPosition({ draft, set, onNext }: StepProps) {
       {summaryParts.length >= 2 && (
         <View style={styles.summaryBox}><Text style={styles.summaryText}>{summaryParts.join(' vs ')}</Text></View>
       )}
-      <NextBtn onPress={onNext} disabled={draft.heroSeat === null || !draft.villainSeats.some(s => s >= 0)} />
+      <NextBtn onPress={handleContinue} />
     </StepScroll>
   );
 }
@@ -1013,7 +1495,9 @@ function StepCards({ draft, set, onNext, onSkip }: StepProps & { onSkip: () => v
         onPendingChange={setPending} />
       {/* Only needed if the user arrives here with both cards already picked
           (back navigation) — a fresh pick auto-advances via onAllFilled. */}
-      {draft.card1 && draft.card2 && <NextBtn onPress={onNext} label="Continue" />}
+      {draft.card1 && draft.card2 && (
+        <FadeSlideIn key="continue"><NextBtn onPress={onNext} label="Continue" /></FadeSlideIn>
+      )}
       <SkipBtn onPress={guardedSkip} label="Skip — no card recording" />
     </StepScroll>
   );
@@ -1080,8 +1564,8 @@ function StepPreflop({ draft, set, onNext, onFold, onEdit, onSizingOpen }: StepP
   const posLabelFor = (actor: string) => { const i = actorOrder.indexOf(actor); return i >= 0 ? posLabelAt(i) : '?'; };
   const dotFor  = (a: string) => a === 'hero' ? HERO_COLOR : a.startsWith('villain') ? (VILLAIN_COLORS[parseInt(a.replace('villain',''),10)-1] ?? VILLAIN_COLORS[0]) : UNNAMED_COLOR;
   const nameFor = (a: string) => {
-    if (a === 'hero') return `Hero · ${posLabelFor(a)}`;
-    if (a.startsWith('villain')) { const vi = parseInt(a.replace('villain',''),10)-1; return `V${vi+1} · ${posLabelFor(a)}`; }
+    if (a === 'hero') return `${heroLabel(draft.heroName)} · ${posLabelFor(a)}`;
+    if (a.startsWith('villain')) return `${villainLabel(a, draft.villainNames)} · ${posLabelFor(a)}`;
     return posLabelFor(a);
   };
   const tabAccent = (a: string) => a === 'hero' ? HERO_COLOR : a.startsWith('villain') ? (parseInt(a.replace('villain',''),10)===1 ? '#C04040' : '#D4683A') : UNNAMED_COLOR;
@@ -1143,10 +1627,17 @@ function StepPreflop({ draft, set, onNext, onFold, onEdit, onSizingOpen }: StepP
       if (draft.preflopActions[i].actor === actor) { lastActIdx = i; break; }
     }
 
-    // Only replace in-place when actor's entry is the last action (no one acted after them).
-    // If others acted after (e.g., a re-raise), keep old action as history and append the
-    // new response — computePreflopState handles multiple entries per actor correctly.
-    const isLastEntry = lastActIdx === draft.preflopActions.length - 1;
+    // Only replace in-place when no OTHER NAMED actor acted after them — a
+    // trailing run of auto-folded unnamed seats (eagerly inserted below,
+    // between this actor and whoever's next) doesn't count as "someone else
+    // acted," so re-opening the sizing panel and confirming a different
+    // amount for the SAME still-selected actor edits their one entry instead
+    // of appending a second one for the same decision (which used to show as
+    // two back-to-back lines for one action, e.g. "raises to 2BB" then
+    // "raises to 3BB"). A genuine re-raise from another named actor still
+    // correctly falls through to the append branch below.
+    const isLastEntry = lastActIdx >= 0 &&
+      !draft.preflopActions.slice(lastActIdx + 1).some(e => namedActors.has(e.actor));
 
     if (lastActIdx >= 0 && isLastEntry) {
       // Direct edit: replace in-place
@@ -1235,7 +1726,7 @@ function StepPreflop({ draft, set, onNext, onFold, onEdit, onSizingOpen }: StepP
       <View style={styles.ctxStrip}>
         <CardFace card={draft.card1} size="sm" />
         <CardFace card={draft.card2} size="sm" />
-        <Text style={styles.ctxText}>Preflop · {fmtSize(state.potBB)}BB pot</Text>
+        <Text style={styles.ctxText}>Preflop · Pot: {fmtDualAmount(state.potBB, draft)}</Text>
       </View>
 
       {/* Side pot breakdown — only when there are all-ins with different investment levels */}
@@ -1256,7 +1747,9 @@ function StepPreflop({ draft, set, onNext, onFold, onEdit, onSizingOpen }: StepP
           const named      = namedActors.has(actor);
           const lastAct    = [...draft.preflopActions].reverse().find(a => a.actor === actor);
           const showChips  = draft.stackUnit === 'Chips' && draft.bigBlind > 0;
-          const fmtTabAmt  = (sz: number) => showChips ? `${fmtSize(sz * draft.bigBlind)}` : `${fmtSize(sz)}BB`;
+          // Tab badge is too narrow for the full "(BB)" bracket — just the
+          // compact number, still never a raw ≥1000 value.
+          const fmtTabAmt  = (sz: number) => showChips ? fmtCompact(sz * draft.bigBlind) : `${fmtSize(sz)}BB`;
           const icon =
             folded ? '✕' :
             allin  ? 'ALL IN' :
@@ -1298,9 +1791,13 @@ function StepPreflop({ draft, set, onNext, onFold, onEdit, onSizingOpen }: StepP
       )}
 
       {(!bettingDone || isEditing) && (
-        <ActionInput
+        <>
+          <PotBadge potBB={stateForSelected.potBB} draft={draft} />
+          <ActionInput
           actor={selectedActor}
           posLabel={posLabelFor(selectedActor)}
+          heroName={heroLabel(draft.heroName)}
+          villainName={selectedActor.startsWith('villain') ? villainLabel(selectedActor, draft.villainNames) : undefined}
           currentBetBB={stateForSelected.currentBetBB}
           potBB={stateForSelected.potBB}
           stackBB={stackFor(selectedActor) - (stateForSelected.investedBB[selectedActor] ?? 0)}
@@ -1309,6 +1806,7 @@ function StepPreflop({ draft, set, onNext, onFold, onEdit, onSizingOpen }: StepP
           initialSizingBB={perActorSizings[selectedActor]}
           isPreflop
           bigBlind={draft.bigBlind}
+          gameType={draft.gameType}
           canRaise={canRaiseForSelected}
           preSelectedAction={preSelectedAction ?? undefined}
           onConfirm={doAction}
@@ -1318,6 +1816,7 @@ function StepPreflop({ draft, set, onNext, onFold, onEdit, onSizingOpen }: StepP
           }}
           onSizingOpen={onSizingOpen}
         />
+        </>
       )}
       {bettingDone && !isEditing && (
         (draft.heroFolded || foldEndsHand) ? (
@@ -1351,10 +1850,14 @@ function StepStreet({ street, phase, onPhaseChange, draft, set, onNext, onFold, 
   const boardCount = street === 'flop' ? 3 : 1;
   const cardsReady = boardCards.filter(Boolean).length === boardCount;
 
+  // Every card used anywhere else in the hand — the picker itself excludes
+  // its own OTHER slots' cards internally, so this can just be the full
+  // board + hero cards without worrying about self-exclusion here.
   const usedCards: CardType[] = [
     draft.card1, draft.card2,
-    ...(street !== 'flop' ? draft.flopCards : []),
-    ...(street === 'river' ? [draft.turnCard] : []),
+    ...draft.flopCards,
+    draft.turnCard,
+    draft.riverCard,
   ].filter(Boolean) as CardType[];
 
   const streetActions = street === 'flop' ? draft.flopActions : street === 'turn' ? draft.turnActions : draft.riverActions;
@@ -1397,14 +1900,14 @@ function StepStreet({ street, phase, onPhaseChange, draft, set, onNext, onFold, 
   const foldEndsHand = state.foldedActors.size > 0 && activeAfterStreet.length <= 1;
 
   const posLabelFor = (a: string) => {
-    if (a === 'hero') return labels[draft.heroSeat ?? 0] ?? 'Hero';
-    if (a.startsWith('villain')) { const vi = parseInt(a.replace('villain',''),10)-1; return labels[draft.villainSeats[vi]??0] ?? `V${vi+1}`; }
+    if (a === 'hero') return labels[draft.heroSeat ?? 0] ?? heroLabel(draft.heroName);
+    if (a.startsWith('villain')) { const vi = parseInt(a.replace('villain',''),10)-1; return labels[draft.villainSeats[vi]??0] ?? villainLabel(a, draft.villainNames); }
     return '?';
   };
   const dotFor  = (a: string) => a === 'hero' ? HERO_COLOR : a.startsWith('villain') ? (VILLAIN_COLORS[parseInt(a.replace('villain',''),10)-1] ?? VILLAIN_COLORS[0]) : UNNAMED_COLOR;
   const nameFor = (a: string) => {
-    if (a === 'hero') return `Hero · ${posLabelFor(a)}`;
-    if (a.startsWith('villain')) { const vi = parseInt(a.replace('villain',''),10)-1; return `V${vi+1} · ${posLabelFor(a)}`; }
+    if (a === 'hero') return `${heroLabel(draft.heroName)} · ${posLabelFor(a)}`;
+    if (a.startsWith('villain')) return `${villainLabel(a, draft.villainNames)} · ${posLabelFor(a)}`;
     return posLabelFor(a);
   };
   const tabAccent = (a: string) => a === 'hero' ? HERO_COLOR : a.startsWith('villain') ? (parseInt(a.replace('villain',''),10)===1 ? '#C04040':'#D4683A') : UNNAMED_COLOR;
@@ -1508,7 +2011,9 @@ function StepStreet({ street, phase, onPhaseChange, draft, set, onNext, onFold, 
         />
         {/* Only needed if the user arrives here with the street's cards
             already picked (back navigation) — a fresh pick auto-advances. */}
-        {cardsReady && <NextBtn onPress={advance} label="Continue" />}
+        {cardsReady && (
+          <FadeSlideIn key="continue"><NextBtn onPress={advance} label="Continue" /></FadeSlideIn>
+        )}
         <SkipBtn onPress={guardedSkip} label={`Skip — no ${streetName} cards`} />
       </StepScroll>
     );
@@ -1521,7 +2026,7 @@ function StepStreet({ street, phase, onPhaseChange, draft, set, onNext, onFold, 
         <CardFace card={draft.card2} size="sm" />
         <View style={styles.ctxSep} />
         {boardSoFar.map((c, i) => <CardFace key={i} card={c} size="sm" />)}
-        <Text style={styles.ctxText}>{fmtSize(state.potBB)}BB</Text>
+        <Text style={styles.ctxText}>Pot: {fmtDualAmount(state.potBB, draft)}</Text>
       </View>
 
       {actingOrder.length > 0 && <StackBar actors={actingOrder} draft={draft} street={street} />}
@@ -1574,20 +2079,25 @@ function StepStreet({ street, phase, onPhaseChange, draft, set, onNext, onFold, 
           )}
 
           {!bettingDone && currentActor ? (
-            <ActionInput
-              actor={currentActor} posLabel={posLabelFor(currentActor)}
-              currentBetBB={state.currentBetBB} potBB={state.potBB}
-              stackBB={actorRemaining(currentActor)}
-              minRaiseBB={state.minRaiseBB > 0 ? state.minRaiseBB : Math.max(1, state.currentBetBB * 2 || 2)}
-              investedBB={state.investedBB[currentActor] ?? 0}
-              isPreflop={false} bigBlind={draft.bigBlind}
-              canRaise={canRaise}
-              onConfirm={handleAction}
-              onSizingOpen={onSizingOpen}
-            />
+            <>
+              <PotBadge potBB={state.potBB} draft={draft} />
+              <ActionInput
+                actor={currentActor} posLabel={posLabelFor(currentActor)}
+                heroName={heroLabel(draft.heroName)}
+                villainName={currentActor.startsWith('villain') ? villainLabel(currentActor, draft.villainNames) : undefined}
+                currentBetBB={state.currentBetBB} potBB={state.potBB}
+                stackBB={actorRemaining(currentActor)}
+                minRaiseBB={state.minRaiseBB > 0 ? state.minRaiseBB : Math.max(1, state.currentBetBB * 2 || 2)}
+                investedBB={state.investedBB[currentActor] ?? 0}
+                isPreflop={false} bigBlind={draft.bigBlind} gameType={draft.gameType}
+                canRaise={canRaise}
+                onConfirm={handleAction}
+                onSizingOpen={onSizingOpen}
+              />
+            </>
           ) : bettingDone ? (
             <>
-              <View style={styles.potBadge}><Text style={styles.potBadgeText}>Pot: {fmtSize(state.potBB)} BB</Text></View>
+              <PotBadge potBB={state.potBB} draft={draft} />
               {(draft.heroFolded || foldEndsHand) ? (
                 <NextBtn onPress={onFold} label="See Results" />
               ) : (
@@ -1620,20 +2130,22 @@ function buildHistory(draft: HandDraft): string {
     if (a.startsWith('seat_')) { const si = parseInt(a.replace('seat_', ''), 10); return labels[si] ?? '?'; }
     return '?';
   };
-  // Always "Villain N" (never a bare "Villain"), so the player list and the
-  // action lines below it always refer to the same name. An unnamed seat
-  // (only possible in a side pot's eligible list, never in the action lines
-  // themselves) falls back to its table position rather than "Villain NaN".
+  // Custom nickname if one was entered on the Position step, else "Villain
+  // N" (never a bare "Villain") — so the player list and the action lines
+  // below it always refer to the same name. An unnamed seat (only possible
+  // in a side pot's eligible list, never in the action lines themselves)
+  // falls back to its table position instead.
   const nameFor = (a: string) => {
-    if (a === 'hero') return 'Hero';
-    if (a.startsWith('villain')) return `Villain ${parseInt(a.replace('villain', ''), 10)}`;
+    if (a === 'hero') return heroLabel(draft.heroName);
+    if (a.startsWith('villain')) return villainLabel(a, draft.villainNames);
     return posFor(a);
   };
 
-  // ── Units: BB throughout, unless this hand was actually tracked in chips —
-  // never mix the two in one export. ─────────────────────────────────────────
-  const useChips = draft.stackUnit === 'Chips' && draft.bigBlind > 0;
-  const fmtAmt = (bb: number) => useChips ? `${fmtSize(bb * draft.bigBlind)} chips` : `${fmtSize(bb)}BB`;
+  // ── Units: BB throughout, unless this hand was actually tracked in the
+  // raw unit too, in which case every amount shows both — a bare number
+  // means nothing without the blind level it was played at. A cash hand
+  // gets a $ sign; a tournament never does.
+  const fmtAmt = (bb: number) => fmtDualAmount(bb, draft);
 
   // ── Starting stacks — a villain's is only "known" if it was actually typed
   // in; otherwise it's assumed equal to Hero's for math, but never presented
@@ -1671,71 +2183,43 @@ function buildHistory(draft: HandDraft): string {
 
   // ── Pot math — each street's state is threaded from the previous street's
   // ending pot, so every number here is the running total of every bet and
-  // call from every player across the whole hand, not just this street. ────
-  const sbBB    = draft.bigBlind > 0 ? draft.smallBlind / draft.bigBlind : 0.5;
-  const stradBB = draft.straddleEnabled && draft.bigBlind > 0 ? draft.straddleAmount / draft.bigBlind : 0;
-  const actorOrder = getFullPreflopActorOrder(draft.playerCount, draft.heroSeat, draft.villainSeats);
-  const initInv     = buildPreflopInvestments(actorOrder, sbBB, stradBB, draft.playerCount);
-  const pf = computePreflopState(draft.preflopActions, sbBB, stradBB, initInv);
-
-  // Ante is dead money that enters the pot before any preflop action, so it
-  // has to be added on top of what computePreflopState tracks (which only
-  // knows about blinds/straddle + player actions). "BB Ante" is one full BB
-  // posted once for the whole table; a flat "Ante" is posted per seat.
-  const anteTotalBB = draft.bigBlind > 0
-    ? draft.anteType === 'bbAnte' ? draft.anteAmount / draft.bigBlind
-      : draft.anteType === 'ante' ? (draft.anteAmount * draft.playerCount) / draft.bigBlind
-      : 0
-    : 0;
-  const pfPotBB = pf.potBB + anteTotalBB;
-
-  const flop  = computeStreetState(draft.flopActions, pfPotBB);
-  const turn  = computeStreetState(draft.turnActions, flop.potBB);
-  const river = computeStreetState(draft.riverActions, turn.potBB);
-
-  // Per-street "already invested before this street" totals, so an all-in
-  // check on the turn (say) accounts for chips already committed preflop
-  // and on the flop, not just what moved on the current street.
-  const combine = (...maps: Record<string, number>[]) => {
-    const out: Record<string, number> = {};
-    for (const m of maps) for (const k in m) out[k] = (out[k] ?? 0) + m[k];
-    return out;
-  };
-  const priorFlop  = combine(pf.investedBB);
-  const priorTurn  = combine(pf.investedBB, flop.investedBB);
-  const priorRiver = combine(pf.investedBB, flop.investedBB, turn.investedBB);
-
-  const finalPotBB = draft.riverCard ? river.potBB
-    : draft.turnCard ? turn.potBB
-    : draft.flopCards.some(Boolean) ? flop.potBB
-    : pfPotBB;
+  // call from every player across the whole hand, not just this street.
+  // Shared with the visual share card so the two can never disagree. ───────
+  const handMath = computeHandMath(draft);
+  const { actorOrder, pf, pfPotBB, flop, turn, river, finalPotBB, priorFlop, priorTurn, priorRiver } = handMath;
 
   // ── Header ──────────────────────────────────────────────────────────────
   const anteLabel = draft.anteType === 'bbAnte' ? 'BB Ante' : draft.anteType === 'ante' ? 'Ante' : '';
+  // "Stakes" is a cash-game term (a $ price per BB); tournament chips have no
+  // real-money price, so that line reads as "Blinds" instead.
   const stakesLine = draft.gameType === 'cash'
-    ? `Stakes: $${fmtSize(draft.cashSB)}/$${fmtSize(draft.cashBB)}${draft.straddleEnabled ? ' · Straddle' : ''}`
-    : `Stakes: ${fmtSize(draft.tournamentSB)}/${fmtSize(draft.tournamentBB)}${anteLabel ? ' ' + anteLabel : ''}`;
+    ? `Stakes: $${fmtCompact(draft.cashSB)}/$${fmtCompact(draft.cashBB)}${draft.straddleEnabled ? ' · Straddle' : ''}`
+    : `Blinds: ${fmtCompact(draft.tournamentSB)}/${fmtCompact(draft.tournamentBB)}${anteLabel ? ' ' + anteLabel : ''}`;
 
   const c1 = draft.card1 ? cardStr(draft.card1) : null;
   const c2 = draft.card2 ? cardStr(draft.card2) : null;
 
   const lines = [stakesLine];
-  lines.push(`Hero: ${heroPos} (${fmtAmt(heroStackBB)})${c1 && c2 ? ` [${c1} ${c2}]` : ''}`);
+  lines.push(`${nameFor('hero')} (${heroPos}): ${fmtAmt(heroStackBB)}${c1 && c2 ? ` [${c1} ${c2}]` : ''}`);
   namedVillains.forEach(v => {
-    // A villain stack that was never entered is a guess, not a fact — leave
-    // it off the player list rather than presenting Hero's stack as theirs.
-    lines.push(`${nameFor(v)}: ${posFor(v)}${stackKnown(v) ? ` (${fmtAmt(stackFor(v))})` : ''}`);
+    // Stack falls back to Hero's (same convention as the rest of the math)
+    // when a villain's own stack was never entered — always show a number
+    // here rather than silently omitting it.
+    lines.push(`${nameFor(v)} (${posFor(v)}): ${fmtAmt(stackFor(v))}`);
   });
   lines.push('');
 
   // ── Streets — preflop has no pot prefix (nothing's been bet before it);
-  // every street after shows the running pot in parens next to its name. ──
+  // every street after shows the running pot in parens next to its name.
+  // A blank line separates each street for readability. ────────────────────
   const preflopStr = streetLine(draft.preflopActions, {});
   lines.push(`Preflop:${preflopStr ? ' ' + preflopStr : ' (no action recorded)'}`);
+  lines.push('');
 
   const pushStreet = (label: string, board: string, potBB: number, acts: ActionEntry[], priorTotal: Record<string, number>) => {
     const actsStr = streetLine(acts, priorTotal);
     lines.push(`${label} (${fmtAmt(potBB)}): ${board}${actsStr ? ' — ' + actsStr : ''}`);
+    lines.push('');
   };
   // Each street header shows the pot as it stood ENTERING that street (the
   // standard hand-history convention, e.g. "Flop (6BB): ... Hero bets 4BB"),
@@ -1752,7 +2236,6 @@ function buildHistory(draft: HandDraft): string {
     const board = [...draft.flopCards, draft.turnCard, draft.riverCard].filter(Boolean).map(c => cardStr(c!)).join(' ');
     pushStreet('River', board, turn.potBB, draft.riverActions, priorRiver);
   }
-  lines.push('');
 
   // ── Result — side pots (only present when there's a genuine all-in
   // disparity) are broken out separately rather than folded into one total. ──
@@ -1767,38 +2250,17 @@ function buildHistory(draft: HandDraft): string {
   // "≥2 eligible" threshold the live SidePotStrip UI uses elsewhere.
   const contestedPots = sidePots.filter(p => p.eligible.length >= 2);
 
-  const allActs = [...draft.preflopActions, ...draft.flopActions, ...draft.turnActions, ...draft.riverActions];
-  const villainFolded = namedVillains.some(v => allActs.some(a => a.actor === v && a.action === 'fold'));
-  const situation: 'hero_folded' | 'villain_folded' | 'showdown' =
-    draft.heroFolded ? 'hero_folded' : villainFolded ? 'villain_folded' : 'showdown';
+  // A villain folding at some point doesn't necessarily end the hand — in a
+  // 3-way pot the remaining players still contest the pot. `situation` is
+  // only 'villain_folded' when EVERY villain has folded, leaving Hero the
+  // lone survivor; otherwise it's a real showdown among whoever's still in.
+  const { situation, liveVillains } = computeHandOutcome(draft);
 
-  // When the hand ends in a fold, only the pot as it stood BEFORE the final
-  // bet/raise actually changes hands — an uncalled bet was never matched, so
-  // it just returns to whoever put it in rather than being "won."
-  const potBeforeDecisiveFold = (): number => {
-    const streets: { acts: ActionEntry[]; recompute: (a: ActionEntry[]) => number }[] = [
-      { acts: draft.riverActions,   recompute: (a) => computeStreetState(a, turn.potBB).potBB },
-      { acts: draft.turnActions,    recompute: (a) => computeStreetState(a, flop.potBB).potBB },
-      { acts: draft.flopActions,    recompute: (a) => computeStreetState(a, pfPotBB).potBB },
-      { acts: draft.preflopActions, recompute: (a) => computePreflopState(a, sbBB, stradBB, initInv).potBB + anteTotalBB },
-    ];
-    for (const s of streets) {
-      let foldIdx = -1;
-      for (let i = s.acts.length - 1; i >= 0; i--) {
-        const e = s.acts[i];
-        if (e.action === 'fold' && (e.actor === 'hero' || e.actor.startsWith('villain'))) { foldIdx = i; break; }
-      }
-      if (foldIdx === -1) continue;
-      const priorAction = s.acts[foldIdx - 1];
-      const cutIdx = priorAction && (priorAction.action === 'bet' || priorAction.action === 'raise' || priorAction.action === 'allin')
-        ? foldIdx - 1 : foldIdx;
-      return s.recompute(s.acts.slice(0, cutIdx));
-    }
-    return finalPotBB;
-  };
+  const potBeforeDecisiveFold = () => computePotBeforeDecisiveFold(draft, handMath);
 
   if (situation === 'showdown') {
-    Object.entries(draft.villainHoleCards).forEach(([vKey, [sc1, sc2]]) => {
+    liveVillains.forEach(vKey => {
+      const [sc1, sc2] = draft.villainHoleCards[vKey] ?? [null, null];
       if (sc1 && sc2) lines.push(`${nameFor(vKey)} shows ${cardStr(sc1)} ${cardStr(sc2)}`);
     });
   }
@@ -1812,13 +2274,18 @@ function buildHistory(draft: HandDraft): string {
   }
 
   if (situation === 'hero_folded') {
-    lines.push(`Hero folds. Pot (${fmtAmt(potBeforeDecisiveFold())}) goes to the table.`);
+    lines.push(`${nameFor('hero')} folds. Pot (${fmtAmt(potBeforeDecisiveFold())}) goes to the table.`);
   } else if (situation === 'villain_folded') {
-    lines.push(`Hero wins ${fmtAmt(potBeforeDecisiveFold())}`);
+    lines.push(`${nameFor('hero')} wins ${fmtAmt(potBeforeDecisiveFold())}`);
   } else if (draft.villainMucked) {
-    lines.push(`Villain mucks. Hero wins ${fmtAmt(finalPotBB)}`);
+    lines.push(`Villain mucks. ${nameFor('hero')} wins ${fmtAmt(finalPotBB)}`);
+  } else if (draft.winner === 'hero') {
+    lines.push(`${nameFor('hero')} wins ${fmtAmt(finalPotBB)}`);
+  } else if (draft.winner) {
+    // A specific villain was picked as the winner (multi-way showdown).
+    lines.push(`${nameFor(draft.winner)} wins ${fmtAmt(finalPotBB)}`);
   } else if (draft.result === 'won') {
-    lines.push(`Hero wins ${fmtAmt(finalPotBB)}`);
+    lines.push(`${nameFor('hero')} wins ${fmtAmt(finalPotBB)}`);
   } else if (draft.result === 'lost') {
     lines.push(`Villain wins ${fmtAmt(finalPotBB)}`);
   } else {
@@ -1833,28 +2300,35 @@ function buildHistory(draft: HandDraft): string {
 function StepResult({ draft, set, onNext }: StepProps) {
   const labels = POSITION_LABELS[draft.playerCount] ?? [];
 
-  const namedVillains = draft.villainSeats.map((_, i) => `villain${i + 1}`);
-  const allActs = [...draft.preflopActions, ...draft.flopActions, ...draft.turnActions, ...draft.riverActions];
-  const villainFolded = namedVillains.some(v => allActs.some(a => a.actor === v && a.action === 'fold'));
+  // Single source of truth shared with the export — a villain folding
+  // earlier doesn't end a multi-way pot while someone else is still in it,
+  // and reaching the river via an all-in runout (no one ever folded) is
+  // always a real showdown, never an assumed Hero win.
+  const { situation, liveVillains } = computeHandOutcome(draft);
 
-  const situation: 'hero_folded' | 'villain_folded' | 'showdown' =
-    draft.heroFolded ? 'hero_folded' : villainFolded ? 'villain_folded' : 'showdown';
+  // Single source of truth for pot math, shared with the export and the
+  // Hand Review screen — no separate re-derivation here to drift out of
+  // sync with those.
+  const handMath = computeHandMath(draft);
+  const autoPot  = handMath.finalPotBB;
+  const heroInvested = (handMath.pf.investedBB['hero'] ?? 0) + (handMath.flop.investedBB['hero'] ?? 0)
+    + (handMath.turn.investedBB['hero'] ?? 0) + (handMath.river.investedBB['hero'] ?? 0);
 
-  const basePot = draft.preflopPotBB > 0 ? draft.preflopPotBB : 1.5;
-  const fEnd    = computeStreetState(draft.flopActions, basePot).potBB;
-  const tEnd    = computeStreetState(draft.turnActions, fEnd).potBB;
-  const rEnd    = computeStreetState(draft.riverActions, tEnd).potBB;
-  const autoPot = Math.max(basePot, fEnd, tEnd, rEnd);
+  // The winner's own net gain (pot won minus their own investment) — never
+  // the gross pot size, which overstates what either player actually made
+  // or lost by however much they themselves put in to win it back.
+  const fmtNetGain = (bb: number) => `+${fmtDualAmount(Math.abs(bb), draft)}`;
 
-  const [showVillainCards, setShowVillainCards] = useState(false);
+  const [villainCardsSkipped, setVillainCardsSkipped] = useState(false);
   const [villainSlots, setVillainSlots] = useState<Record<string, number>>({});
   const [confirmedVillains, setConfirmedVillains] = useState<Set<string>>(new Set());
 
   const nameFor = (a: string) => {
-    if (a === 'hero') return `Hero · ${labels[draft.heroSeat??0]??'?'}`;
-    if (a.startsWith('villain')) { const vi=parseInt(a.replace('villain',''),10)-1; return `V${vi+1} · ${labels[draft.villainSeats[vi]??0]??'?'}`; }
+    if (a === 'hero') return `${heroLabel(draft.heroName)} · ${labels[draft.heroSeat??0]??'?'}`;
+    if (a.startsWith('villain')) return `${villainLabel(a, draft.villainNames)} · ${labels[draft.villainSeats[parseInt(a.replace('villain',''),10)-1]??0]??'?'}`;
     return '?';
   };
+  const villainNum = (a: string) => parseInt(a.replace('villain', ''), 10);
 
   // Used cards for hole-card picker: hero cards + board cards + other villains' cards
   const boardUsedCards: CardType[] = [
@@ -1864,21 +2338,19 @@ function StepResult({ draft, set, onNext }: StepProps) {
     draft.riverCard,
   ].filter(Boolean) as CardType[];
 
-  const history = buildHistory(draft);
-
   return (
     <StepScroll>
       {/* Outcome banner */}
       {situation === 'hero_folded' && (
         <View style={[styles.outcomeBanner, { backgroundColor: '#FEE8E8' }]}>
           <Text style={[styles.outcomeTitle, { color: '#C04040' }]}>You Folded</Text>
-          <Text style={styles.outcomeSub}>{fmtSize(autoPot)}BB pot</Text>
+          <Text style={styles.outcomeSub}>Villain {fmtNetGain(heroInvested)}</Text>
         </View>
       )}
       {situation === 'villain_folded' && (
         <View style={[styles.outcomeBanner, { backgroundColor: '#E8F5EE' }]}>
           <Text style={[styles.outcomeTitle, { color: HERO_COLOR }]}>Villain Folded — You Win</Text>
-          <Text style={styles.outcomeSub}>{fmtSize(autoPot)}BB pot</Text>
+          <Text style={styles.outcomeSub}>Hero {fmtNetGain(computeFoldWinNet(draft, handMath))}</Text>
         </View>
       )}
       {situation === 'showdown' && (
@@ -1888,109 +2360,94 @@ function StepResult({ draft, set, onNext }: StepProps) {
         </View>
       )}
 
-      {/* Showdown villain card entry */}
-      {situation === 'showdown' && !draft.villainMucked && (
+      {/* Showdown: optionally record cards for whichever villains are still
+          live — a villain who folded earlier isn't offered here or in the
+          export. Who actually won is never asked; the export just states
+          the pot when it can't be auto-determined from a fold. */}
+      {situation === 'showdown' && (
         <>
-          <Label text="Showdown" />
-          <View style={{ gap: 8 }}>
-            <Pressable onPress={() => { set({ villainMucked: true, potSizeBB: Math.round(autoPot) }); setShowVillainCards(false); }}
-              style={({ pressed }) => [styles.showdownBtn, draft.villainMucked && { borderColor: HERO_COLOR }, pressed && { opacity: 0.7 }]}>
-              <Text style={styles.showdownBtnText}>Villain Mucked — Hero Wins</Text>
-            </Pressable>
-            <Pressable onPress={() => setShowVillainCards(!showVillainCards)}
-              style={({ pressed }) => [styles.showdownBtn, showVillainCards && { borderColor: '#C04040' }, pressed && { opacity: 0.7 }]}>
-              <Text style={styles.showdownBtnText}>Villain Shows Cards</Text>
-            </Pressable>
-          </View>
+          {!villainCardsSkipped && (
+            <>
+              <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
+                <Text style={styles.label}>Add villain cards (optional)</Text>
+                <Pressable onPress={() => setVillainCardsSkipped(true)} hitSlop={8} style={{ marginLeft: 'auto' }}>
+                  <Text style={{ fontSize: 13, fontWeight: '700', color: C.textSecondary }}>Skip</Text>
+                </Pressable>
+              </View>
 
-          {showVillainCards && namedVillains.map((vKey, i) => {
-            const color     = VILLAIN_COLORS[i] ?? VILLAIN_COLORS[0];
-            const vLabel    = nameFor(vKey);
-            const cards     = draft.villainHoleCards[vKey] ?? [null, null];
-            const slot      = villainSlots[vKey] ?? 0;
-            const isConfirmed = confirmedVillains.has(vKey);
-            const bothPicked  = cards[0] !== null && cards[1] !== null;
-            const otherVillainCards: CardType[] = namedVillains
-              .filter(v => v !== vKey)
-              .flatMap(v => draft.villainHoleCards[v] ?? [null, null])
-              .filter(Boolean) as CardType[];
-            const usedCards = [...boardUsedCards, ...otherVillainCards];
+              {liveVillains.map((vKey) => {
+                const color     = VILLAIN_COLORS[villainNum(vKey) - 1] ?? VILLAIN_COLORS[0];
+                const vLabel    = nameFor(vKey);
+                const cards     = draft.villainHoleCards[vKey] ?? [null, null];
+                const slot      = villainSlots[vKey] ?? 0;
+                const isConfirmed = confirmedVillains.has(vKey);
+                const bothPicked  = cards[0] !== null && cards[1] !== null;
+                const otherVillainCards: CardType[] = liveVillains
+                  .filter(v => v !== vKey)
+                  .flatMap(v => draft.villainHoleCards[v] ?? [null, null])
+                  .filter(Boolean) as CardType[];
+                const usedCards = [...boardUsedCards, ...otherVillainCards];
 
-            return (
-              <View key={vKey} style={[styles.villainCardSection, { borderColor: isConfirmed ? color : color + '55' }]}>
-                <View style={styles.villainCardHeader}>
-                  <View style={[styles.actorDot, { backgroundColor: color }]} />
-                  <Text style={[styles.villainCardTitle, { color }]}>{vLabel}</Text>
-                  {isConfirmed && (
-                    <Pressable onPress={() => setConfirmedVillains(prev => { const s = new Set(prev); s.delete(vKey); return s; })}
-                      style={{ marginLeft: 'auto' }}>
-                      <Text style={{ fontSize: 12, color: C.textSecondary, fontWeight: '500' }}>Change</Text>
-                    </Pressable>
-                  )}
-                </View>
-                {isConfirmed ? (
-                  <View style={{ flexDirection: 'row', gap: 12, justifyContent: 'center', paddingVertical: 8 }}>
-                    <CardFace card={cards[0]} size="md" />
-                    <CardFace card={cards[1]} size="md" />
-                  </View>
-                ) : (
-                  <>
-                    <CardPicker
-                      cards={cards}
-                      activeSlot={slot}
-                      onSlotPress={(s) => setVillainSlots(prev => ({ ...prev, [vKey]: s }))}
-                      onCardPicked={(s, card) => {
-                        const next: [CardType | null, CardType | null] = [...(draft.villainHoleCards[vKey] ?? [null, null])] as [CardType | null, CardType | null];
-                        next[s] = card;
-                        set({ villainHoleCards: { ...draft.villainHoleCards, [vKey]: next } });
-                        const nextEmpty = next.findIndex((c, idx) => idx !== s && c === null);
-                        if (nextEmpty !== -1) setVillainSlots(prev => ({ ...prev, [vKey]: nextEmpty }));
-                      }}
-                      onClear={(s) => {
-                        const next: [CardType | null, CardType | null] = [...(draft.villainHoleCards[vKey] ?? [null, null])] as [CardType | null, CardType | null];
-                        next[s] = null;
-                        set({ villainHoleCards: { ...draft.villainHoleCards, [vKey]: next } });
-                        setVillainSlots(prev => ({ ...prev, [vKey]: s }));
-                      }}
-                      usedCards={usedCards}
-                    />
-                    {bothPicked && (
-                      <Pressable onPress={() => setConfirmedVillains(prev => new Set([...prev, vKey]))}
-                        style={({ pressed }) => [styles.confirmCardBtn, pressed && { opacity: 0.8 }]}>
-                        <Text style={styles.confirmCardBtnText}>Confirm Cards ✓</Text>
-                      </Pressable>
+                return (
+                  <View key={vKey} style={[styles.villainCardSection, { borderColor: isConfirmed ? color : color + '55' }]}>
+                    <View style={styles.villainCardHeader}>
+                      <View style={[styles.actorDot, { backgroundColor: color }]} />
+                      <Text style={[styles.villainCardTitle, { color }]}>{vLabel}</Text>
+                      {isConfirmed && (
+                        <Pressable onPress={() => setConfirmedVillains(prev => { const s = new Set(prev); s.delete(vKey); return s; })}
+                          style={{ marginLeft: 'auto' }}>
+                          <Text style={{ fontSize: 12, color: C.textSecondary, fontWeight: '500' }}>Change</Text>
+                        </Pressable>
+                      )}
+                    </View>
+                    {isConfirmed ? (
+                      <View style={{ flexDirection: 'row', gap: 12, justifyContent: 'center', paddingVertical: 8 }}>
+                        <CardFace card={cards[0]} size="md" />
+                        <CardFace card={cards[1]} size="md" />
+                      </View>
+                    ) : (
+                      <>
+                        <CardPicker
+                          cards={cards}
+                          activeSlot={slot}
+                          onSlotPress={(s) => setVillainSlots(prev => ({ ...prev, [vKey]: s }))}
+                          onCardPicked={(s, card) => {
+                            const next: [CardType | null, CardType | null] = [...(draft.villainHoleCards[vKey] ?? [null, null])] as [CardType | null, CardType | null];
+                            next[s] = card;
+                            set({ villainHoleCards: { ...draft.villainHoleCards, [vKey]: next } });
+                            const nextEmpty = next.findIndex((c, idx) => idx !== s && c === null);
+                            if (nextEmpty !== -1) setVillainSlots(prev => ({ ...prev, [vKey]: nextEmpty }));
+                          }}
+                          onClear={(s) => {
+                            const next: [CardType | null, CardType | null] = [...(draft.villainHoleCards[vKey] ?? [null, null])] as [CardType | null, CardType | null];
+                            next[s] = null;
+                            set({ villainHoleCards: { ...draft.villainHoleCards, [vKey]: next } });
+                            setVillainSlots(prev => ({ ...prev, [vKey]: s }));
+                          }}
+                          usedCards={usedCards}
+                        />
+                        {bothPicked && (
+                          <Pressable onPress={() => setConfirmedVillains(prev => new Set([...prev, vKey]))}
+                            style={({ pressed }) => [styles.confirmCardBtn, pressed && { opacity: 0.8 }]}>
+                            <Text style={styles.confirmCardBtnText}>Confirm Cards ✓</Text>
+                          </Pressable>
+                        )}
+                      </>
                     )}
-                  </>
-                )}
-              </View>
-            );
-          })}
-
-          {showVillainCards && (
-            <View style={{ gap: 8, marginTop: 4 }}>
-              <Label text="Result" />
-              <View style={{ flexDirection: 'row', gap: 8 }}>
-                <Pressable onPress={() => set({ result: 'won' })}
-                  style={({ pressed }) => [styles.showdownBtn, { flex: 1 }, draft.result === 'won' && { borderColor: HERO_COLOR }, pressed && { opacity: 0.7 }]}>
-                  <Text style={styles.showdownBtnText}>Hero Won</Text>
-                </Pressable>
-                <Pressable onPress={() => set({ result: 'lost' })}
-                  style={({ pressed }) => [styles.showdownBtn, { flex: 1 }, draft.result === 'lost' && { borderColor: '#C04040' }, pressed && { opacity: 0.7 }]}>
-                  <Text style={styles.showdownBtnText}>Hero Lost</Text>
-                </Pressable>
-              </View>
-            </View>
+                  </View>
+                );
+              })}
+            </>
           )}
         </>
       )}
 
-      <Pressable onPress={() => Share.share({ message: history }).catch(() => {})}
-        style={({ pressed }) => [styles.shareBtn, pressed && { opacity: 0.7 }]}>
-        <Text style={styles.shareBtnText}>Share / Copy Hand History</Text>
-      </Pressable>
       <NextBtn onPress={() => {
         const update: Partial<HandDraft> = { potSizeBB: Math.round(autoPot) };
-        if (situation === 'villain_folded') update.result = 'won';
+        // Only a true fold-to-one-player situation gets an auto-assigned
+        // winner — a real showdown's winner comes from the picker above,
+        // never assumed here.
+        if (situation === 'villain_folded') { update.result = 'won'; update.winner = 'hero'; }
         else if (situation === 'hero_folded') update.result = 'lost';
         set(update);
         onNext();
@@ -2001,23 +2458,44 @@ function StepResult({ draft, set, onNext }: StepProps) {
 
 // ── Step 9: Name & Save ────────────────────────────────────────────────────────
 
-function StepNameTag({ draft, set, onSave, onFocusScroll }: StepProps & { onSave: () => void; onFocusScroll?: () => void }) {
+function StepNameTag({ draft, set, onSave, onFocusScroll, onOpenShareSheet, sharingImage }: StepProps & {
+  onSave: () => void; onFocusScroll?: () => void; onOpenShareSheet: () => void; sharingImage: boolean;
+}) {
   const auto = autoHandName(draft);
+
+  // Staggered reveal — each group lands 50ms after the previous one, top to
+  // bottom, for a polished "unrolling" feel on the last screen of the flow.
   return (
     <StepScroll>
-      <Label text="Name this hand" />
-      <TextInput style={styles.nameInput} placeholder={auto} placeholderTextColor={C.textSecondary}
-        value={draft.handName} onChangeText={(v) => set({ handName: v })} maxLength={80} returnKeyType="done"
-        onSubmitEditing={() => Keyboard.dismiss()} onFocus={onFocusScroll} />
-      <Text style={styles.nameHint}>Leave blank to auto-generate: "{auto}"</Text>
-      <Label text="Notes" />
-      <TextInput style={styles.notesInput} placeholder="Any thoughts on this hand…"
-        placeholderTextColor={C.textSecondary} value={draft.notes}
-        onChangeText={(v) => set({ notes: v })} multiline maxLength={300} onFocus={onFocusScroll} />
-      <DoneLink />
-      <Pressable onPress={onSave} style={({ pressed }) => [styles.saveBtn, pressed && { opacity: 0.8 }]}>
-        <Text style={styles.saveBtnText}>Save Hand</Text>
-      </Pressable>
+      <FadeSlideIn delay={0} style={{ gap: 14 }}>
+        <Label text="Name this hand" />
+        <TextInput style={styles.nameInput} placeholder={auto} placeholderTextColor={C.textSecondary}
+          value={draft.handName} onChangeText={(v) => set({ handName: v })} maxLength={80} returnKeyType="done"
+          onSubmitEditing={() => Keyboard.dismiss()} onFocus={onFocusScroll} />
+        <Text style={styles.nameHint}>Leave blank to auto-generate: "{auto}"</Text>
+      </FadeSlideIn>
+      <FadeSlideIn delay={50} style={{ gap: 14 }}>
+        <Label text="Notes" />
+        <TextInput style={styles.notesInput} placeholder="Any thoughts on this hand…"
+          placeholderTextColor={C.textSecondary} value={draft.notes}
+          onChangeText={(v) => set({ notes: v })} multiline maxLength={300} onFocus={onFocusScroll} />
+        <DoneLink />
+      </FadeSlideIn>
+      <FadeSlideIn delay={100}>
+        <ScaleButton onPress={onOpenShareSheet} disabled={sharingImage} style={[styles.shareBtn, sharingImage && { opacity: 0.5 }]}>
+          <Text style={styles.shareBtnText}>{sharingImage ? 'Preparing image…' : 'Share Hand'}</Text>
+        </ScaleButton>
+      </FadeSlideIn>
+      <FadeSlideIn delay={150}>
+        <ScaleButton onPress={() => Share.share({ message: buildHistory(draft) }).catch(() => {})} style={styles.shareTextLink}>
+          <Text style={styles.shareTextLinkText}>Copy / share as text</Text>
+        </ScaleButton>
+      </FadeSlideIn>
+      <FadeSlideIn delay={200}>
+        <ScaleButton onPress={onSave} style={styles.saveBtn}>
+          <Text style={styles.saveBtnText}>Save Hand</Text>
+        </ScaleButton>
+      </FadeSlideIn>
     </StepScroll>
   );
 }
@@ -2038,10 +2516,10 @@ function fmtActionShort(entry: ActionEntry): string {
 
 function posLabelForActor(draft: HandDraft, actor: string): string {
   const labels = POSITION_LABELS[draft.playerCount] ?? [];
-  if (actor === 'hero') return labels[draft.heroSeat ?? 0] ?? 'Hero';
+  if (actor === 'hero') return labels[draft.heroSeat ?? 0] ?? heroLabel(draft.heroName);
   if (actor.startsWith('villain')) {
     const vi = parseInt(actor.replace('villain', ''), 10) - 1;
-    return labels[draft.villainSeats[vi] ?? 0] ?? `V${vi + 1}`;
+    return labels[draft.villainSeats[vi] ?? 0] ?? villainLabel(actor, draft.villainNames);
   }
   return '?';
 }
@@ -2096,9 +2574,14 @@ function summaryStreet(street: 'flop' | 'turn' | 'river', draft: HandDraft): str
 }
 
 function summaryResult(draft: HandDraft): string {
-  if (draft.heroFolded) return 'Hero folded';
-  if (draft.result === 'won') return draft.villainMucked ? 'Villain mucked — Hero wins' : 'Showdown — Hero wins';
-  if (draft.result === 'lost') return 'Showdown — Hero loses';
+  const hero = heroLabel(draft.heroName);
+  if (draft.heroFolded) return `${hero} folded`;
+  if (draft.result === 'won') return draft.villainMucked ? `Villain mucked — ${hero} wins` : `Showdown — ${hero} wins`;
+  if (draft.result === 'lost') {
+    return draft.winner && draft.winner !== 'hero'
+      ? `Showdown — ${villainLabel(draft.winner, draft.villainNames)} wins`
+      : `Showdown — ${hero} loses`;
+  }
   return 'Showdown';
 }
 
@@ -2123,17 +2606,20 @@ interface SectionWrapProps {
   // instead of the plain small-caps label every other section gets.
   divider?: boolean;
   children: ReactNode;
+  // Reopens this section for editing — only wired (and only rendered as
+  // tappable) once the section is actually done, so the active section
+  // itself never fights with its own live inputs for the tap.
+  onPress?: () => void;
 }
 
 // One screen's section: a persistent label above a card — done, it's a
-// read-only, non-interactive recap row (checkmark + one-line summary);
-// active, it's the fully live-editable body for the step you're currently
-// on (marked out by the green left-border accent). Going back to change an
-// earlier step is done via the screen's own Back button, not by tapping its
-// recap card. The accent is a separate absolutely-positioned bar (not a
-// real border) so it can fade in/out on its own — the card reserves its
-// width permanently via paddingLeft so nothing shifts.
-function SectionWrap({ title, summary, isDone, divider, children }: SectionWrapProps) {
+// read-only recap row (checkmark + one-line summary) that's tappable to
+// jump straight back into editing it; active, it's the fully live-editable
+// body for the step you're currently on (marked out by the green
+// left-border accent). The accent is a separate absolutely-positioned bar
+// (not a real border) so it can fade in/out on its own — the card reserves
+// its width permanently via paddingLeft so nothing shifts.
+function SectionWrap({ title, summary, isDone, divider, children, onPress }: SectionWrapProps) {
   const accentOpacity = useRef(new Animated.Value(isDone ? 0 : 1)).current;
   const mountedRef = useRef(false);
 
@@ -2147,21 +2633,29 @@ function SectionWrap({ title, summary, isDone, divider, children }: SectionWrapP
     }).start();
   }, [isDone, accentOpacity]);
 
+  const card = (
+    <View style={[styles.sectionCard, isDone ? styles.sectionCardDone : styles.sectionCardActive]}>
+      {isDone && <View style={styles.sectionGreyBar} />}
+      <Animated.View pointerEvents="none" style={[styles.sectionAccentBar, { opacity: accentOpacity }]} />
+      {isDone ? (
+        <>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.sectionDoneSummary} numberOfLines={1}>{summary}</Text>
+          </View>
+          <AnimatedCheckmark />
+        </>
+      ) : children}
+    </View>
+  );
+
   return (
     <View>
       {divider ? <StreetDivider label={title} /> : <Text style={styles.sectionLabel}>{title}</Text>}
-      <View style={[styles.sectionCard, isDone ? styles.sectionCardDone : styles.sectionCardActive]}>
-        {isDone && <View style={styles.sectionGreyBar} />}
-        <Animated.View pointerEvents="none" style={[styles.sectionAccentBar, { opacity: accentOpacity }]} />
-        {isDone ? (
-          <>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.sectionDoneSummary} numberOfLines={1}>{summary}</Text>
-            </View>
-            <AnimatedCheckmark />
-          </>
-        ) : children}
-      </View>
+      {isDone && onPress ? (
+        <Pressable onPress={onPress} style={({ pressed }) => pressed && { opacity: 0.7 }}>
+          {card}
+        </Pressable>
+      ) : card}
     </View>
   );
 }
@@ -2172,20 +2666,91 @@ export interface LogHandModalProps {
   visible: boolean;
   onClose: () => void;
   onSave: (draft: HandDraft) => void;
+  // When set, the flow opens pre-filled with this hand instead of a blank
+  // one, landing straight on the final (Name & Save) step with every prior
+  // section already collapsed and done — the "swipe to edit" entry point.
+  initialDraft?: HandDraft | null;
 }
 
-export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
+export function LogHandModal({ visible, onClose, onSave, initialDraft }: LogHandModalProps) {
   const [step,  setStep]  = useState(1);
   const [draft, setDraft] = useState<HandDraft>(INITIAL_DRAFT);
   const [flopPhase,  setFlopPhase]  = useState<'cards' | 'action'>('cards');
   const [turnPhase,  setTurnPhase]  = useState<'cards' | 'action'>('cards');
   const [riverPhase, setRiverPhase] = useState<'cards' | 'action'>('cards');
+
+  // Seed from the hand being edited every time the modal opens — the same
+  // completion flags saved with that hand (preflopComplete etc.) are what
+  // let the accordion render every section already collapsed/done.
+  useEffect(() => {
+    if (!visible) return;
+    if (initialDraft) {
+      setDraft(initialDraft);
+      setStep(TOTAL_STEPS);
+      setFlopPhase('action'); setTurnPhase('action'); setRiverPhase('action');
+    }
+  }, [visible, initialDraft]);
   const scrollRef = useRef<ScrollView>(null);
+  // Measured on layout — see the Positions scroll-target special-case below.
+  const positionsY = useRef(0);
+  // Same idea, for the Blinds & Stack step: its SB/BB fields sit well above
+  // the bottom of the content, so scrollToEnd() overshoots past them — the
+  // keyboard opening over a field the scroll position hasn't accounted for
+  // is exactly what hides the number the user is typing.
+  const blindsY = useRef(0);
   const progressAnim = useRef(new Animated.Value(0)).current;
   // Shared by the notes field's focus handler and the raise/bet sizing
   // panel's open handler — both need "reveal the newly-grown bottom of the
   // screen" and neither can reach scrollRef directly.
   const scrollToEndSoon = () => setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
+  const scrollToBlindsSoon = () => setTimeout(
+    () => scrollRef.current?.scrollTo({ y: Math.max(0, blindsY.current - 8), animated: true }), 50);
+
+  // Share-card capture — the ViewShot node itself renders off-screen (see
+  // hiddenCardHost below), never visible as a preview anywhere; it's only
+  // ever generated the moment the user taps Share and confirms.
+  const viewShotRef = useRef<ViewShot>(null);
+  const [sharingImage, setSharingImage] = useState(false);
+  // Most people sharing a hand don't want to spoil what villain held.
+  const [hideVillainCards, setHideVillainCards] = useState(true);
+  // Tapping Share opens this small confirm sheet (toggle + Share/Cancel)
+  // rather than sharing immediately.
+  const [shareSheetOpen, setShareSheetOpen] = useState(false);
+
+  const handleShareImage = async () => {
+    if (sharingImage) return;
+    setSharingImage(true);
+    console.log('[ShareHand:TagSave] starting — hideVillainCards =', hideVillainCards);
+    try {
+      // Let the sheet's closing animation and any last-second re-render from
+      // the villain-cards toggle actually flush to the native view before
+      // snapshotting it — capturing mid-transition is a known way for
+      // react-native-view-shot to hang instead of resolving or rejecting.
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      if (!viewShotRef.current?.capture) throw new Error("Share card isn't ready yet — try again in a moment.");
+      console.log('[ShareHand:TagSave] capturing…');
+      const uri = await withTimeout(viewShotRef.current.capture(), 10000, 'Image generation timed out — please try again.');
+      console.log('[ShareHand:TagSave] capture returned uri:', uri);
+      if (!uri) throw new Error('No image was generated — please try again.');
+      // Capture succeeded — don't leave the button reading "Preparing…" for
+      // however long the OS share sheet stays open waiting on the user.
+      setSharingImage(false);
+      const canShare = await Sharing.isAvailableAsync();
+      console.log('[ShareHand:TagSave] Sharing.isAvailableAsync ->', canShare);
+      if (canShare) {
+        await Sharing.shareAsync(uri, { mimeType: 'image/png', dialogTitle: 'Share Hand' });
+        console.log('[ShareHand:TagSave] shareAsync resolved (sheet closed)');
+      } else {
+        Alert.alert("Sharing isn't available", 'This device has no share sheet to send the image through.');
+      }
+    } catch (err) {
+      console.error('[ShareHand:TagSave] failed:', err);
+      setSharingImage(false);
+      Alert.alert('Could not share hand', err instanceof Error ? err.message : 'Something went wrong generating the image.');
+    }
+  };
+  const openShareSheet = () => setShareSheetOpen(true);
+  const confirmShareImage = () => { setShareSheetOpen(false); handleShareImage(); };
 
   const set  = (u: Partial<HandDraft>) => setDraft(prev => ({ ...prev, ...u }));
   const next = () => { animateAccordion(); setStep(s => Math.min(s + 1, TOTAL_STEPS)); };
@@ -2199,7 +2764,11 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
   // they get dealt fresh. No-op for fields that were already empty, so it's
   // safe to call on every action commit, not just true edits.
   const clearAfter = (street: 'preflop' | 'flop' | 'turn' | 'river') => {
-    set({ heroFolded: false, foldedOn: null });
+    // Result-step picks (who won, villain cards) were made against the OLD
+    // outcome too — e.g. Villain 2 was picked as the showdown winner, but
+    // this edit now makes Villain 2 fold before showdown. Stale results are
+    // worse than no results, so wipe them along with the downstream streets.
+    set({ heroFolded: false, foldedOn: null, result: null, winner: null, villainMucked: false, villainHoleCards: {} });
     if (street === 'preflop') {
       set({ flopCards: [null, null, null], flopActions: [], flopComplete: false });
       setFlopPhase('cards');
@@ -2229,6 +2798,26 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
     setStep(s => Math.max(1, s - 1));
   };
 
+  // Reopen an earlier DONE section for editing (tapping anywhere on its
+  // collapsed card, not just a pencil/checkmark) — walks backward one
+  // logical screen at a time using the exact same transitions as pressing
+  // Back repeatedly, so every section's active/done state stays consistent
+  // instead of jumping straight to a step number and leaving a completed
+  // street's sub-phase in whatever state it happened to be left at.
+  const jumpToStep = (target: number) => {
+    let s = step, fp = flopPhase, tp = turnPhase, rp = riverPhase;
+    while (s > target) {
+      if (s === 6 && fp === 'action')       { fp = 'cards'; continue; }
+      else if (s === 7 && tp === 'action')  { tp = 'cards'; continue; }
+      else if (s === 7 && tp === 'cards')   { s = 6; fp = 'action'; continue; }
+      else if (s === 8 && rp === 'action')  { rp = 'cards'; continue; }
+      else if (s === 8 && rp === 'cards')   { s = 7; tp = 'action'; continue; }
+      s = Math.max(target, s - 1);
+    }
+    animateAccordion();
+    setStep(s); setFlopPhase(fp); setTurnPhase(tp); setRiverPhase(rp);
+  };
+
   const handleClose = () => {
     setDraft(INITIAL_DRAFT); setStep(1);
     setFlopPhase('cards'); setTurnPhase('cards'); setRiverPhase('cards');
@@ -2253,7 +2842,18 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
   // The hand is built top-to-bottom in real time — every time a new section
   // becomes active, scroll down to reveal it.
   useEffect(() => {
-    const t = setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 80);
+    const t = setTimeout(() => {
+      if (step === 3) {
+        // Positions is by far the tallest section (table diagram + hero and
+        // villain selectors) — scrolling to the very end like every other
+        // step does overshoots past its own "POSITIONS" label, cutting it
+        // off at the top of the viewport instead of bringing the section
+        // into view starting from its own top.
+        scrollRef.current?.scrollTo({ y: Math.max(0, positionsY.current - 8), animated: true });
+      } else {
+        scrollRef.current?.scrollToEnd({ animated: true });
+      }
+    }, 80);
     return () => clearTimeout(t);
   }, [step, flopPhase, turnPhase, riverPhase]);
 
@@ -2282,10 +2882,13 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
 
   // A street section only exists once it's actually been reached — either
   // it's the active step right now, or its *Complete flag says it was
-  // finished earlier (covers both normal advance and a fold jumping ahead).
-  const showFlop  = draft.flopComplete  || step === 6;
-  const showTurn  = draft.turnComplete  || step === 7;
-  const showRiver = draft.riverComplete || step === 8;
+  // finished earlier AND we haven't since navigated back before it (covers
+  // normal advance, a fold jumping ahead, and tapping an earlier done
+  // section to re-edit it without leaving a stale empty card on screen for
+  // streets that are technically complete but currently behind `step`).
+  const showFlop  = step === 6 || (draft.flopComplete  && step > 6);
+  const showTurn  = step === 7 || (draft.turnComplete  && step > 7);
+  const showRiver = step === 8 || (draft.riverComplete && step > 8);
 
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="fullScreen" onRequestClose={confirmClose}>
@@ -2305,7 +2908,7 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
               {step === 1 ? (
                 <StepGameType draft={draft} set={set} onNext={next} />
               ) : (
-                <SectionWrap title="Game Type" summary={draft.gameType === 'cash' ? 'Cash Game' : 'Tournament'} isDone>
+                <SectionWrap title="Game Type" summary={draft.gameType === 'cash' ? 'Cash Game' : 'Tournament'} isDone onPress={() => jumpToStep(1)}>
                   {null}
                 </SectionWrap>
               )}
@@ -2313,23 +2916,27 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
 
             {step >= 2 && (
               <AppearingSection>
-                <SectionWrap title="Blinds & Stack" summary={summaryGameSetup(draft)} isDone={step > 2}>
-                  {step === 2 && <StepBlinds draft={draft} set={set} onNext={next} />}
-                </SectionWrap>
+                <View onLayout={(e) => { blindsY.current = e.nativeEvent.layout.y; }}>
+                  <SectionWrap title="Blinds & Stack" summary={summaryGameSetup(draft)} isDone={step > 2} onPress={() => jumpToStep(2)}>
+                    {step === 2 && <StepBlinds draft={draft} set={set} onNext={next} onFieldFocus={scrollToBlindsSoon} />}
+                  </SectionWrap>
+                </View>
               </AppearingSection>
             )}
 
             {step >= 3 && (
               <AppearingSection>
-                <SectionWrap title="Positions" summary={summaryPosition(draft)} isDone={step > 3}>
-                  {step === 3 && <StepPosition draft={draft} set={set} onNext={next} />}
-                </SectionWrap>
+                <View onLayout={(e) => { positionsY.current = e.nativeEvent.layout.y; }}>
+                  <SectionWrap title="Positions" summary={summaryPosition(draft)} isDone={step > 3} onPress={() => jumpToStep(3)}>
+                    {step === 3 && <StepPosition draft={draft} set={set} onNext={next} />}
+                  </SectionWrap>
+                </View>
               </AppearingSection>
             )}
 
             {step >= 4 && (
               <AppearingSection>
-                <SectionWrap title="Hole Cards" summary={summaryCards(draft)} isDone={step > 4}>
+                <SectionWrap title="Hole Cards" summary={summaryCards(draft)} isDone={step > 4} onPress={() => jumpToStep(4)}>
                   {step === 4 && <StepCards draft={draft} set={set} onNext={next} onSkip={next} />}
                 </SectionWrap>
               </AppearingSection>
@@ -2337,7 +2944,7 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
 
             {step >= 5 && (
               <AppearingSection>
-                <SectionWrap title="Preflop" summary={summaryPreflop(draft)} isDone={step > 5} divider>
+                <SectionWrap title="Preflop" summary={summaryPreflop(draft)} isDone={step > 5} divider onPress={() => jumpToStep(5)}>
                   {step === 5 && (
                     <StepPreflop draft={draft} set={set} onNext={next} onFold={skip} onEdit={() => clearAfter('preflop')}
                       onSizingOpen={scrollToEndSoon} />
@@ -2348,7 +2955,7 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
 
             {showFlop && (
               <AppearingSection>
-                <SectionWrap title="Flop" summary={summaryStreet('flop', draft)} isDone={step > 6} divider>
+                <SectionWrap title="Flop" summary={summaryStreet('flop', draft)} isDone={step > 6} divider onPress={() => jumpToStep(6)}>
                   {step === 6 && (
                     <StepStreet street="flop" phase={flopPhase} onPhaseChange={(p) => { animateAccordion(); setFlopPhase(p); }}
                       draft={draft} set={set} onNext={next} onFold={skip} onEdit={() => clearAfter('flop')}
@@ -2360,7 +2967,7 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
 
             {showTurn && (
               <AppearingSection>
-                <SectionWrap title="Turn" summary={summaryStreet('turn', draft)} isDone={step > 7} divider>
+                <SectionWrap title="Turn" summary={summaryStreet('turn', draft)} isDone={step > 7} divider onPress={() => jumpToStep(7)}>
                   {step === 7 && (
                     <StepStreet street="turn" phase={turnPhase} onPhaseChange={(p) => { animateAccordion(); setTurnPhase(p); }}
                       draft={draft} set={set} onNext={next} onFold={skip} onEdit={() => clearAfter('turn')}
@@ -2372,7 +2979,7 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
 
             {showRiver && (
               <AppearingSection>
-                <SectionWrap title="River" summary={summaryStreet('river', draft)} isDone={step > 8} divider>
+                <SectionWrap title="River" summary={summaryStreet('river', draft)} isDone={step > 8} divider onPress={() => jumpToStep(8)}>
                   {step === 8 && (
                     <StepStreet street="river" phase={riverPhase} onPhaseChange={(p) => { animateAccordion(); setRiverPhase(p); }}
                       draft={draft} set={set} onNext={next} onFold={skip} onEdit={() => clearAfter('river')}
@@ -2384,7 +2991,7 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
 
             {step >= 9 && (
               <AppearingSection>
-                <SectionWrap title="Result" summary={summaryResult(draft)} isDone={step > 9}>
+                <SectionWrap title="Result" summary={summaryResult(draft)} isDone={step > 9} onPress={() => jumpToStep(9)}>
                   {step === 9 && <StepResult draft={draft} set={set} onNext={next} />}
                 </SectionWrap>
               </AppearingSection>
@@ -2396,12 +3003,53 @@ export function LogHandModal({ visible, onClose, onSave }: LogHandModalProps) {
                   <Text style={styles.sectionLabel}>Tag &amp; Save</Text>
                   <View style={[styles.sectionCard, styles.sectionCardActive]}>
                     <StepNameTag draft={draft} set={set} onNext={next} onSave={handleSave}
-                      onFocusScroll={scrollToEndSoon} />
+                      onFocusScroll={scrollToEndSoon} onOpenShareSheet={openShareSheet} sharingImage={sharingImage} />
                   </View>
                 </View>
               </AppearingSection>
             )}
           </ScrollView>
+
+          {/* Off-screen — outside the ScrollView so it's never clipped —
+              captured for the share image, never shown to the user as a
+              preview anywhere. Non-animated and always mounted once a game
+              type is chosen, so it's already laid out by the time Share is
+              tapped instead of racing a fade-in. */}
+          {draft.gameType && (
+            <View pointerEvents="none" style={styles.hiddenCardHost}>
+              {/* No width/height override — react-native-view-shot's default
+                  capture is already in real device pixels (it multiplies by
+                  the native screen scale internally on both platforms),
+                  which is the sharpest this library can produce. Its own
+                  README warns that forcing width/height "might affect image
+                  quality" (it resamples the bitmap) — there's no separate
+                  pixelRatio option to bump instead, so leaving these unset
+                  is what actually maximizes sharpness here. */}
+              <ViewShot ref={viewShotRef} options={{ format: 'png', quality: 1, result: 'tmpfile' }}>
+                <HandHistoryCard draft={draft} now={new Date()} hideVillainCards={hideVillainCards} />
+              </ViewShot>
+            </View>
+          )}
+
+          {/* Share confirm sheet — the only place the villain-cards toggle
+              is ever shown, and only right before actually sharing. */}
+          <Modal visible={shareSheetOpen} transparent animationType="fade" onRequestClose={() => setShareSheetOpen(false)}>
+            <View style={styles.sheetOverlay}>
+              <Pressable style={StyleSheet.absoluteFill} onPress={() => setShareSheetOpen(false)} />
+              <View style={styles.sheetPanel}>
+                <Text style={styles.sheetTitle}>Share Hand</Text>
+                <VillainCardsToggle value={hideVillainCards} onToggle={() => setHideVillainCards(v => !v)} />
+                <View style={styles.sheetActions}>
+                  <Pressable onPress={() => setShareSheetOpen(false)} style={styles.sheetCancelBtn}>
+                    <Text style={styles.sheetCancelBtnText}>Cancel</Text>
+                  </Pressable>
+                  <Pressable onPress={confirmShareImage} style={styles.sheetShareBtn} disabled={sharingImage}>
+                    <Text style={styles.sheetShareBtnText}>{sharingImage ? 'Preparing…' : 'Share'}</Text>
+                  </Pressable>
+                </View>
+              </View>
+            </View>
+          </Modal>
         </SafeAreaView>
       </KeyboardAvoidingView>
     </Modal>
@@ -2416,6 +3064,10 @@ const styles = StyleSheet.create({
   header:      { paddingHorizontal: Spacing.four, paddingTop: Spacing.two, paddingBottom: Spacing.two, borderBottomWidth: 1, borderBottomColor: C.backgroundElement },
   headerRow:   { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   headerTitle: { fontSize: 17, fontWeight: '800', color: C.text },
+  // Step 1 only — plain left-title/right-action row, same shape as every
+  // other top-level screen header in the app (e.g. the Hands tab).
+  headerRowFlat:    { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  headerTitleLarge: { fontSize: 28, fontWeight: '700', color: C.text, letterSpacing: -0.4 },
   headerSide:  { minWidth: 60, justifyContent: 'center' },
   headerSideRight: { alignItems: 'flex-end' },
   backBtn:     { flexDirection: 'row', alignItems: 'center', minHeight: 44, paddingRight: 8 },
@@ -2461,10 +3113,8 @@ const styles = StyleSheet.create({
   // cream text when chosen, cream with a dark outline and dark text
   // otherwise. Nothing selectable should read as plain text.
   chipRow:       { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  chip:          { paddingHorizontal: 16, minHeight: 44, justifyContent: 'center', borderRadius: 12, backgroundColor: C.backgroundElement, borderWidth: 1.5, borderColor: C.text },
-  chipActive:    { backgroundColor: HERO_COLOR, borderColor: HERO_COLOR },
-  chipText:      { fontSize: 14, fontWeight: '700', color: C.text },
-  chipTextActive:{ color: C.background },
+  chip:          { paddingHorizontal: 16, minHeight: 44, justifyContent: 'center', borderRadius: 12, borderWidth: 1.5 },
+  chipText:      { fontSize: 14, fontWeight: '700' },
 
   twoCol: { flexDirection: 'row', gap: 10 },
 
@@ -2472,10 +3122,23 @@ const styles = StyleSheet.create({
   numInput: { flex: 1, fontSize: 20, fontWeight: '700', color: C.text, paddingVertical: 12, textAlign: 'center' },
   stackNote:{ fontSize: 12, color: C.textSecondary, textAlign: 'center', marginTop: -6 },
 
-  unitToggle:       { flexDirection: 'column', borderWidth: 1.5, borderColor: C.text, borderRadius: 8, overflow: 'hidden' },
-  unitBtn:          { paddingHorizontal: 10, paddingVertical: 7, alignItems: 'center', backgroundColor: C.backgroundElement, minWidth: 44 },
-  unitBtnText:      { fontSize: 11, fontWeight: '700', color: C.text },
-  unitBtnTextActive:{ color: C.background },
+  // `overflow: 'hidden'` clipping a square-cornered filled child against a
+  // rounded border is what left a hairline gap of the container's own
+  // background showing through at the corners — glaring once the selected
+  // segment fills solid green against it. Rounding the OUTER corners of the
+  // end segments directly (instead of relying on clipping) draws them
+  // correctly to begin with, so there's nothing left to clip.
+  unitToggle:       { flexDirection: 'row', alignSelf: 'center', marginLeft: 8, marginVertical: 6, borderWidth: 1.5, borderColor: C.text, borderRadius: 10 },
+  // Fixed `width`, not `minWidth` — a floor lets "Chips" (wider text) push
+  // past "BB" and the two segments render at different widths, which is
+  // what made the pill look lopsided/broken. A fixed width sized to the
+  // longer label keeps both segments identical regardless of content.
+  unitBtn:          { width: 64, paddingHorizontal: 8, paddingVertical: 10, justifyContent: 'center', alignItems: 'center', backgroundColor: C.background },
+  unitBtnFirst:     { borderTopLeftRadius: 8.5, borderBottomLeftRadius: 8.5 },
+  unitBtnLast:      { borderTopRightRadius: 8.5, borderBottomRightRadius: 8.5 },
+  unitBtnDivider:   { borderLeftWidth: 1.5, borderLeftColor: C.text },
+  unitBtnText:      { fontSize: 13, fontWeight: '700', color: C.text, textAlign: 'center' },
+  unitBtnTextActive:{ color: C.tintText },
 
   nextBtn:        { backgroundColor: C.tint, borderRadius: 14, paddingVertical: 16, alignItems: 'center' },
   nextBtnOff:     { backgroundColor: C.backgroundElement },
@@ -2484,17 +3147,43 @@ const styles = StyleSheet.create({
   skipBtn:        { alignItems: 'center', justifyContent: 'center', minHeight: 44, paddingVertical: 8 },
   skipBtnText:    { fontSize: 13, color: C.textSecondary, textDecorationLine: 'underline' },
 
-  // Full-screen game type picker — two big bordered buttons, clean text only.
+  // Full-screen game type picker — plain cream background, two equal
+  // bordered cards filling the screen (the heading lives in the top header
+  // bar instead, see headerTitleLarge), and a Continue slot below them.
+  // gap here must stay in sync with GAME_TYPE_GAP — both are used to size
+  // the cards row (gameTypeScreen gets an explicit height computed from
+  // this, not flex:1) so it never resizes when Continue fades in.
+  gameTypeRoot:    { backgroundColor: C.background, gap: 16 },
   gameTypeScreen:  { gap: 12 },
-  gameTypeBtn:     { flex: 1, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: C.text, borderRadius: 20, backgroundColor: C.backgroundElement },
-  gameTypeBtnText: { fontSize: 26, fontWeight: '800', color: C.text },
+  // Always rendered (never conditionally mounted) so its space is reserved
+  // whether or not a card is selected — that's what stops the cards above
+  // from shifting size the moment Continue becomes visible.
+  gameTypeContinueSlot: { justifyContent: 'center' },
+  // Same border color and weight on both cards — Cash vs Tournament reads
+  // through the text only, not the outline.
+  gameTypeBtn:           { flex: 1, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: '#1B4332', borderRadius: 20 },
+  gameTypeBtnText:       { fontSize: 26, fontWeight: '800' },
 
   selectorBtn:  { flexDirection: 'row', alignItems: 'center', backgroundColor: C.backgroundElement, borderRadius: 14, padding: 14, gap: 12, borderWidth: 2, borderColor: 'transparent' },
+  // Sits on top of a selector box, opacity-pulsed 3x to flag a missing
+  // required field on a blocked Continue press — never rendered any other
+  // time, so it starts fully transparent and costs nothing when idle.
+  pulseOverlay: { ...StyleSheet.absoluteFillObject, borderRadius: 14, borderWidth: 3, borderColor: '#E8542E' },
+  // Padded container so the static highlight border/fill has room to sit
+  // around a Blinds-step input group without clipping its contents.
+  highlightWrap: { position: 'relative', borderRadius: 14, padding: 8, margin: -8, gap: 14, borderWidth: 2, borderColor: 'transparent' },
+  kbToolbar: { flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 8, backgroundColor: C.backgroundElement, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: C.backgroundSelected },
+  kbToolbarBtn: { backgroundColor: HERO_COLOR, borderRadius: 18, paddingHorizontal: 22, paddingVertical: 9, minWidth: 92, alignItems: 'center' },
+  kbToolbarBtnOff: { backgroundColor: C.backgroundSelected },
+  kbToolbarBtnPressed: { opacity: 0.85 },
+  kbToolbarText: { fontSize: 15, fontWeight: '700', color: '#F5F0E8' },
+  kbToolbarTextOff: { color: C.textSecondary },
   selectorDot:  { width: 12, height: 12, borderRadius: 6, flexShrink: 0 },
   selectorTitle:{ fontSize: 10, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.6, marginBottom: 2 },
   selectorSeat: { fontSize: 16, fontWeight: '700', color: C.text },
   selectorArrow:{ fontSize: 20, color: C.textSecondary, fontWeight: '300' },
   vstackLabel:  { fontSize: 12, fontWeight: '600', color: C.textSecondary, width: 58 },
+  villainNameInput: { flex: 1, fontSize: 14, fontWeight: '600', color: C.text, backgroundColor: C.backgroundElement, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 10 },
   addVillainBtn:{ borderRadius: 14, borderWidth: 1.5, borderColor: C.backgroundSelected, borderStyle: 'dashed', padding: 16, alignItems: 'center' },
   addVillainText:{ fontSize: 15, fontWeight: '700', color: C.textSecondary },
   removeBtn:    { width: 38, height: 38, borderRadius: 10, backgroundColor: '#FEE8E8', alignItems: 'center', justifyContent: 'center' },
@@ -2536,8 +3225,7 @@ const styles = StyleSheet.create({
   actionBadgeText:{ fontSize: 12, fontWeight: '700' },
 
   actionInput:       { borderWidth: 2, borderRadius: 16, padding: 14, gap: 10, marginTop: 2 },
-  actionInputHeader: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  actionInputTitle:  { fontSize: 12, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.6 },
+  turnLabel: { fontSize: 15, fontWeight: '800', letterSpacing: 0.2, textAlign: 'center' },
   actionBtnsRow:     { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   // Each action gets a clear outlined box (colored per its semantic meaning
   // in ACTION_COLORS), not just a filled chip — the border stays visible
@@ -2562,10 +3250,24 @@ const styles = StyleSheet.create({
   outcomeBanner: { borderRadius: 16, padding: 20, alignItems: 'center', gap: 4 },
   outcomeTitle:  { fontSize: 20, fontWeight: '800' },
   outcomeSub:    { fontSize: 14, color: C.textSecondary, fontWeight: '500' },
-  showdownBtn:     { borderWidth: 1.5, borderColor: C.backgroundSelected, borderRadius: 14, padding: 16, alignItems: 'center' },
-  showdownBtnText: { fontSize: 15, fontWeight: '700', color: C.text },
   shareBtn:        { borderWidth: 1.5, borderColor: C.tint, borderRadius: 12, paddingVertical: 13, alignItems: 'center' },
   shareBtnText:    { fontSize: 14, fontWeight: '700', color: C.tint },
+  shareTextLink:     { alignItems: 'center', paddingVertical: 6 },
+  shareTextLinkText: { fontSize: 12, fontWeight: '600', color: C.textSecondary, textDecorationLine: 'underline' },
+
+  // Rendered off-screen purely so react-native-view-shot has real, laid-out
+  // dimensions to capture — never visible to the user.
+  hiddenCardHost: { position: 'absolute', top: 0, left: -3000 },
+
+  // Share confirm sheet
+  sheetOverlay:      { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.4)' },
+  sheetPanel:        { backgroundColor: C.background, borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: Spacing.four, paddingBottom: Spacing.six, gap: 16 },
+  sheetTitle:        { fontSize: 16, fontWeight: '800', color: C.text, textAlign: 'center' },
+  sheetActions:      { flexDirection: 'row', gap: 10 },
+  sheetCancelBtn:    { flex: 1, alignItems: 'center', paddingVertical: 13, borderRadius: 12, backgroundColor: C.backgroundElement },
+  sheetCancelBtnText:{ fontSize: 14, fontWeight: '700', color: C.textSecondary },
+  sheetShareBtn:     { flex: 1, alignItems: 'center', paddingVertical: 13, borderRadius: 12, backgroundColor: C.tint },
+  sheetShareBtnText: { fontSize: 14, fontWeight: '700', color: C.tintText },
 
   villainCardSection: { borderWidth: 1.5, borderRadius: 14, padding: 12, gap: 10 },
   villainCardHeader:  { flexDirection: 'row', alignItems: 'center', gap: 8 },

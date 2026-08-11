@@ -40,7 +40,6 @@ import {
   BankrollHistoryPoint,
   BankrollTotals,
   CashStats,
-  LeakStat,
   TournamentStats,
   WeekHistoryEntry,
   WeeklyProgress,
@@ -51,7 +50,6 @@ import {
   computeTournamentStats,
   currentStreak,
   longestStreak,
-  topLeaks,
   weeklyHistory,
   weeklyProgress,
 } from '@/utils/stats';
@@ -71,6 +69,10 @@ interface AppDataContextValue {
   hands: HandRecord[];
   addHand: (draft: HandDraft) => HandRecord;
   updateHandReview: (id: string, review: HandReview, status: ReviewStatus) => void;
+  updateHandDraft: (id: string, draft: HandDraft) => void;
+  deleteHand: (id: string) => void;
+  markHandReviewed: (id: string) => void;
+  toggleHandFlag: (id: string) => void;
 
   bankroll: BankrollTransaction[];
   startingBankroll: number;
@@ -110,7 +112,6 @@ interface AppDataContextValue {
     longestStreak: number;
     weeklyProgress: WeeklyProgress;
     weeklyHistory: WeekHistoryEntry[];
-    topLeaks: LeakStat[];
     bankrollTotals: BankrollTotals;
     cashStats: CashStats;
     tournamentStats: TournamentStats;
@@ -186,6 +187,33 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
 
   const updateHandReview = (id: string, review: HandReview, status: ReviewStatus) => {
     setHands(prev => prev.map(r => (r.id === id ? { ...r, review, status } : r)));
+  };
+
+  // Re-save from "swipe to edit" — re-derives every display field from the
+  // edited draft (positions, cards, pot type/size can all have changed)
+  // while keeping the same id/createdAt/review/status/flagged.
+  const updateHandDraft = (id: string, draft: HandDraft) => {
+    setHands(prev => prev.map(r => {
+      if (r.id !== id) return r;
+      const regenerated = draftToRecord(draft, r.id, r.createdAt);
+      return { ...regenerated, review: r.review, status: r.status, flagged: r.flagged };
+    }));
+  };
+
+  const deleteHand = (id: string) => {
+    setHands(prev => prev.filter(r => r.id !== id));
+  };
+
+  // Quick "mark reviewed" from the list swipe action — same effect as
+  // ticking it inside the full review modal, without opening it.
+  const markHandReviewed = (id: string) => {
+    setHands(prev => prev.map(r => (r.id === id
+      ? { ...r, status: 'reviewed', review: { ...r.review, markedReviewed: true, reviewedAt: new Date().toISOString() } }
+      : r)));
+  };
+
+  const toggleHandFlag = (id: string) => {
+    setHands(prev => prev.map(r => (r.id === id ? { ...r, flagged: !r.flagged } : r)));
   };
 
   const addTransaction = (tx: Omit<BankrollTransaction, 'id' | 'loggedAt'>) => {
@@ -291,7 +319,6 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       longestStreak: longestStreak(hands, bankroll),
       weeklyProgress: weeklyProgress(hands, goalTargets),
       weeklyHistory: weeklyHistory(hands, goalTargets),
-      topLeaks: topLeaks(hands),
       bankrollTotals,
       cashStats: computeCashStats(bankroll),
       tournamentStats: computeTournamentStats(bankroll),
@@ -307,6 +334,10 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     hands,
     addHand,
     updateHandReview,
+    updateHandDraft,
+    deleteHand,
+    markHandReviewed,
+    toggleHandFlag,
     bankroll,
     startingBankroll,
     addTransaction,

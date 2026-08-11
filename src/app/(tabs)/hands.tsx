@@ -1,7 +1,8 @@
 import { useLocalSearchParams } from 'expo-router';
-import { useEffect, useState } from 'react';
-import { ActivityIndicator, Keyboard, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { MutableRefObject, useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, Alert, Animated, Keyboard, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { Swipeable, TouchableOpacity } from 'react-native-gesture-handler';
 
 import { HandReviewModal } from '@/components/hand-review/hand-review-modal';
 import { HandRecord, ReviewStatus } from '@/components/hand-review/types';
@@ -76,6 +77,141 @@ function notesPreviewFor(record: HandRecord): string | null {
   return trimmed.length > 50 ? `${trimmed.slice(0, 50)}...` : trimmed;
 }
 
+// ── Swipe-to-act row ─────────────────────────────────────────────────────────
+
+function SwipeAction({ label, bg, onPress, last }: { label: string; bg: string; onPress: () => void; last?: boolean }) {
+  return (
+    <Pressable onPress={onPress} style={[styles.swipeAction, { backgroundColor: bg }, !last && styles.swipeActionDivider]}>
+      <Text style={styles.swipeActionText}>{label}</Text>
+    </Pressable>
+  );
+}
+
+// A single joined bar, not four separate floating buttons — segments sit
+// flush against each other (no gaps/margins/individual rounding) inside one
+// rounded, clipped container. ACTIONS_WIDTH is the container's exact
+// rendered width (4 × 68, no padding or margin anywhere in it) — Swipeable
+// clamps the drag to this same auto-measured width internally, so as long
+// as this constant matches the real layout exactly, the swipe travels the
+// full distance needed to reveal every segment, never stopping partway.
+const SWIPE_BTN_WIDTH = 68;
+const ACTIONS_WIDTH = SWIPE_BTN_WIDTH * 4;
+
+function HandCard({ record, onPress, onEdit, onDelete, onMarkReviewed, onToggleFlag, openSwipeRef }: {
+  record: HandRecord;
+  onPress: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+  onMarkReviewed: () => void;
+  onToggleFlag: () => void;
+  // Shared across every card in the list so opening one can close whichever
+  // other card was previously open — only one swipe strip visible at a time.
+  openSwipeRef: MutableRefObject<Swipeable | null>;
+}) {
+  const swipeableRef = useRef<Swipeable>(null);
+
+  const borderColor = STATUS_COLOR[record.status];
+
+  const confirmDelete = (swipeable: Swipeable) => {
+    Alert.alert('Delete this hand?', 'This removes it permanently — it cannot be undone.', [
+      { text: 'Cancel', style: 'cancel', onPress: () => swipeable.close() },
+      { text: 'Delete', style: 'destructive', onPress: onDelete },
+    ]);
+  };
+
+  return (
+    <Swipeable
+      ref={swipeableRef}
+      overshootRight={false}
+      onSwipeableOpenStartDrag={() => {
+        // Fires the instant a closed row's drag becomes active — well before
+        // release — so the previously-open card snaps shut immediately
+        // rather than waiting for this one to finish opening.
+        if (openSwipeRef.current && openSwipeRef.current !== swipeableRef.current) {
+          openSwipeRef.current.close();
+        }
+        openSwipeRef.current = swipeableRef.current;
+      }}
+      onSwipeableClose={() => {
+        if (openSwipeRef.current === swipeableRef.current) openSwipeRef.current = null;
+      }}
+      renderRightActions={(_progress: Animated.AnimatedInterpolation<number>, dragX: Animated.AnimatedInterpolation<number>, swipeable: Swipeable) => {
+        // dragX runs 0 (closed) → negative (dragged left). Map that directly
+        // to how far the action strip has slid out from under the card, so
+        // it reveals in lockstep with the finger instead of flashing in.
+        const translateX = dragX.interpolate({
+          inputRange: [-ACTIONS_WIDTH, 0],
+          outputRange: [0, ACTIONS_WIDTH],
+          extrapolate: 'clamp',
+        });
+        return (
+          <Animated.View style={[styles.swipeActions, { transform: [{ translateX }] }]}>
+            <SwipeAction label="Delete" bg={C.negative} onPress={() => confirmDelete(swipeable)} />
+            <SwipeAction label="Mark as Reviewed" bg={C.tint} onPress={() => { onMarkReviewed(); swipeable.close(); }} />
+            <SwipeAction label="Flag" bg={C.gold} onPress={() => { onToggleFlag(); swipeable.close(); }} />
+            <SwipeAction label="Edit" bg={C.textSecondary} onPress={() => { onEdit(); swipeable.close(); }} last />
+          </Animated.View>
+        );
+      }}>
+      {/* A plain react-native Pressable here fights the Swipeable's own pan
+          gesture for the touch — the drag would get swallowed as a tap and
+          open the review modal instead of revealing the actions. Using
+          gesture-handler's own TouchableOpacity keeps both gestures on the
+          same recognizer so a horizontal drag is never mistaken for a tap. */}
+      <TouchableOpacity
+        onPress={onPress}
+        activeOpacity={0.7}
+        style={[
+          styles.handCard,
+          { borderLeftWidth: 3, borderLeftColor: borderColor },
+          record.flagged && styles.handCardFlagged,
+        ]}>
+        <View style={styles.handTop}>
+          <View style={styles.handLeft}>
+            <View style={styles.handTitleRow}>
+              <View style={[styles.statusDot, { backgroundColor: STATUS_COLOR[record.status] }]} />
+              <Text style={styles.handTitle}>{handTitleFor(record)}</Text>
+            </View>
+            {notesPreviewFor(record) && (
+              <Text style={styles.handNotesPreview}>{notesPreviewFor(record)}</Text>
+            )}
+            <Text style={styles.handMeta}>
+              {record.displayPotType} · {record.displayStreet} · {record.displayPotSize} BB pot
+            </Text>
+            {/* Study flags summary */}
+            {(() => {
+              const seen = new Map<string, string>();
+              [
+                ...Object.values(record.review.actionNotes).flatMap(n => n.flags),
+                ...Object.values(record.review.streetNotes).flatMap(n => n.flags),
+              ].forEach(f => { if (!seen.has(f.label)) seen.set(f.label, f.color); });
+              const allFlags = [...seen.entries()].slice(0, 3);
+              if (allFlags.length === 0) return null;
+              return (
+                <View style={styles.flagChipRow}>
+                  {allFlags.map(([label, color]) => (
+                    <View key={label} style={[styles.miniFlag, { backgroundColor: color + '22', borderColor: color + '88' }]}>
+                      <Text style={[styles.miniFlagText, { color }]}>{label}</Text>
+                    </View>
+                  ))}
+                </View>
+              );
+            })()}
+          </View>
+          <View style={styles.handRight}>
+            <View style={[styles.statusBadge, { backgroundColor: STATUS_BADGE_BG[record.status] }]}>
+              <Text style={[styles.statusBadgeText, { color: STATUS_BADGE_TEXT[record.status] }]}>
+                {STATUS_LABEL[record.status]}
+              </Text>
+            </View>
+            <Text style={styles.handDate}>{formatDate(record.createdAt)}</Text>
+          </View>
+        </View>
+      </TouchableOpacity>
+    </Swipeable>
+  );
+}
+
 const FILTERS: { key: FilterTab; label: string }[] = [
   { key: 'all',        label: 'All'        },
   { key: 'unreviewed', label: 'Unreviewed' },
@@ -87,22 +223,40 @@ const FILTERS: { key: FilterTab; label: string }[] = [
 
 export default function HandsScreen() {
   const params = useLocalSearchParams<{ filter?: string }>();
-  const { hands: records, loading, addHand, updateHandReview } = useAppData();
+  const { hands: records, loading, addHand, updateHandReview, updateHandDraft, deleteHand, markHandReviewed, toggleHandFlag } = useAppData();
 
   const [activeFilter, setActiveFilter] = useState<FilterTab>(
     (params.filter as FilterTab) ?? 'all'
   );
   const [search, setSearch]             = useState('');
   const [showLog, setShowLog]           = useState(false);
+  const [editingRecord, setEditingRecord] = useState<HandRecord | null>(null);
   const [reviewRecord, setReviewRecord] = useState<HandRecord | null>(null);
+  // Only one card's swipe actions are ever open at once — each HandCard
+  // registers itself here and closes whichever card held it before.
+  const openSwipeRef = useRef<Swipeable | null>(null);
 
   // Tabs stay mounted, so re-apply an incoming filter param on every navigation
   useEffect(() => {
     if (params.filter) setActiveFilter(params.filter as FilterTab);
   }, [params.filter]);
 
+  // Same modal instance handles both "Log Hand" and "swipe to edit" — which
+  // one it was decides whether saving creates a new record or re-derives an
+  // existing one in place.
   const handleSave = (draft: Parameters<typeof addHand>[0]) => {
-    addHand(draft);
+    if (editingRecord) {
+      updateHandDraft(editingRecord.id, draft);
+      setEditingRecord(null);
+    } else {
+      addHand(draft);
+    }
+  };
+
+  const handleEdit = (record: HandRecord) => {
+    if (!record.draft) { Alert.alert('Cannot edit', 'This hand has no editable data.'); return; }
+    setEditingRecord(record);
+    setShowLog(true);
   };
 
   const handleReviewUpdate = (id: string, review: Parameters<typeof updateHandReview>[1], status: ReviewStatus) => {
@@ -193,57 +347,16 @@ export default function HandsScreen() {
               </View>
             ) : (
               filtered.map(record => (
-                <Pressable
+                <HandCard
                   key={record.id}
+                  record={record}
                   onPress={() => setReviewRecord(record)}
-                  style={({ pressed }) => [
-                    styles.handCard,
-                    { borderLeftWidth: 3, borderLeftColor: STATUS_COLOR[record.status] },
-                    pressed && styles.dimmed,
-                  ]}>
-                  <View style={styles.handTop}>
-                    <View style={styles.handLeft}>
-                      <View style={styles.handTitleRow}>
-                        <View style={[styles.statusDot, { backgroundColor: STATUS_COLOR[record.status] }]} />
-                        <Text style={styles.handTitle}>{handTitleFor(record)}</Text>
-                        {record.flagged && <Text style={styles.flagIcon}> 🚩</Text>}
-                      </View>
-                      {notesPreviewFor(record) && (
-                        <Text style={styles.handNotesPreview}>{notesPreviewFor(record)}</Text>
-                      )}
-                      <Text style={styles.handMeta}>
-                        {record.displayPotType} · {record.displayStreet} · {record.displayPotSize} BB pot
-                      </Text>
-                      {/* Study flags summary */}
-                      {(() => {
-                        const allFlags = [
-                          ...new Set([
-                            ...Object.values(record.review.actionNotes).flatMap(n => n.flags),
-                            ...Object.values(record.review.streetNotes).flatMap(n => n.flags),
-                          ])
-                        ].slice(0, 3);
-                        if (allFlags.length === 0) return null;
-                        return (
-                          <View style={styles.flagChipRow}>
-                            {allFlags.map(f => (
-                              <View key={f} style={styles.miniFlag}>
-                                <Text style={styles.miniFlagText}>{f}</Text>
-                              </View>
-                            ))}
-                          </View>
-                        );
-                      })()}
-                    </View>
-                    <View style={styles.handRight}>
-                      <View style={[styles.statusBadge, { backgroundColor: STATUS_BADGE_BG[record.status] }]}>
-                        <Text style={[styles.statusBadgeText, { color: STATUS_BADGE_TEXT[record.status] }]}>
-                          {STATUS_LABEL[record.status]}
-                        </Text>
-                      </View>
-                      <Text style={styles.handDate}>{formatDate(record.createdAt)}</Text>
-                    </View>
-                  </View>
-                </Pressable>
+                  onEdit={() => handleEdit(record)}
+                  onDelete={() => deleteHand(record.id)}
+                  onMarkReviewed={() => markHandReviewed(record.id)}
+                  onToggleFlag={() => toggleHandFlag(record.id)}
+                  openSwipeRef={openSwipeRef}
+                />
               ))
             )}
           </ScrollView>
@@ -252,8 +365,9 @@ export default function HandsScreen() {
 
       <LogHandModal
         visible={showLog}
-        onClose={() => setShowLog(false)}
+        onClose={() => { setShowLog(false); setEditingRecord(null); }}
         onSave={handleSave}
+        initialDraft={editingRecord?.draft}
       />
 
       <HandReviewModal
@@ -314,12 +428,14 @@ const styles = StyleSheet.create({
     padding: Spacing.three,
     overflow: 'hidden',
   },
+  // A warm red tint across the whole card, not just one edge — flagged
+  // hands should feel different everywhere you look, not on a single border.
+  handCardFlagged: { backgroundColor: 'rgba(192, 57, 57, 0.12)' },
   handTop:      { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' },
   handLeft:     { flex: 1, marginRight: Spacing.two, gap: 4 },
   handTitleRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap' },
   statusDot:    { width: 8, height: 8, borderRadius: 4, marginRight: 7 },
   handTitle:    { fontSize: 15, fontWeight: '700', color: C.text },
-  flagIcon:     { fontSize: 13 },
   handNotesPreview: { fontSize: 12, color: C.textSecondary, marginLeft: 15 },
   handMeta:     { fontSize: 13, color: C.textSecondary, marginLeft: 15 },
   handRight:    { alignItems: 'flex-end', gap: 6 },
@@ -332,4 +448,12 @@ const styles = StyleSheet.create({
   miniFlagText: { fontSize: 9, fontWeight: '700', color: C.textSecondary },
 
   dimmed:    { opacity: 0.7 },
+
+  // One rounded, clipped container — segments below sit flush against each
+  // other with no gaps or corners of their own, reading as a single compact
+  // action bar rather than separate floating buttons.
+  swipeActions: { flexDirection: 'row', alignItems: 'stretch', borderRadius: 12, overflow: 'hidden' },
+  swipeAction:  { width: SWIPE_BTN_WIDTH, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 3 },
+  swipeActionDivider: { borderRightWidth: 1, borderRightColor: 'rgba(255,255,255,0.22)' },
+  swipeActionText: { fontSize: 10, fontWeight: '700', color: '#fff', textAlign: 'center' },
 });

@@ -44,10 +44,22 @@ export interface HandDraft {
   effectiveStack: number;
   stackUnit: StackUnit;
   effectiveStackBB: number;
+  // Has the Blinds screen's own guided sub-steps (Players → Blinds → Ante →
+  // Stack) already been walked through once? Re-mounting this step (jumping
+  // back to edit it, or reopening a saved hand) should show every sub-step
+  // at once rather than replaying the reveal from scratch. Old hands saved
+  // before this field existed are covered by the *Complete flags below —
+  // reaching any later street already proves this step was finished once.
+  blindsStepSeen: boolean;
   // ── Step 3: Position ──────────────────────────────────────
   heroSeat: number | null;
+  // Optional nickname for Hero — empty/unset falls back to "Hero" everywhere.
+  heroName: string;
   villainSeats: number[];
   villainStacksBB: Record<string, number>; // keyed 'villain1','villain2','villain3'
+  // Optional nicknames (e.g. "Fish", "Reg") keyed the same way — empty/unset
+  // falls back to "Villain N" everywhere the actor is displayed.
+  villainNames: Record<string, string>;
   // ── Step 4: Cards ─────────────────────────────────────────
   card1: CardType | null;
   card2: CardType | null;
@@ -73,7 +85,11 @@ export interface HandDraft {
   lastStreet: StreetName;
   // ── Step 9: Result ────────────────────────────────────────
   villainMucked: boolean;       // showdown: villain mucks → hero wins
-  result: ResultType | null;    // only set in showdown where we can't auto-determine
+  result: ResultType | null;    // hero's own perspective — 'won' unless winner is a villain
+  // Who actually won the pot at showdown — 'hero' or 'villain1'/'villain2'/'villain3'.
+  // Only meaningful when the hand reached showdown with more than one live player;
+  // null until the user picks (never auto-assumed).
+  winner: string | null;
   potSizeBB: number;
   // Keyed 'villain1', 'villain2', 'villain3' — tuple is [card1, card2]
   villainHoleCards: Record<string, [CardType | null, CardType | null]>;
@@ -92,7 +108,8 @@ export const INITIAL_DRAFT: HandDraft = {
   anteType: 'none', anteAmount: 0,
   playerCount: 6,
   effectiveStack: 100, stackUnit: 'BB', effectiveStackBB: 100,
-  heroSeat: null, villainSeats: [], villainStacksBB: {},
+  blindsStepSeen: false,
+  heroSeat: null, heroName: '', villainSeats: [], villainStacksBB: {}, villainNames: {},
   card1: null, card2: null,
   preflopActions: [], preflopComplete: false, potType: 'SRP', preflopPotBB: 0,
   flopCards: [null, null, null], turnCard: null, riverCard: null,
@@ -100,7 +117,7 @@ export const INITIAL_DRAFT: HandDraft = {
   turnActions: [], turnComplete: false,
   riverActions: [], riverComplete: false,
   heroFolded: false, foldedOn: null, lastStreet: 'preflop',
-  villainMucked: false, result: null, potSizeBB: 0,
+  villainMucked: false, result: null, winner: null, potSizeBB: 0,
   villainHoleCards: {},
   handName: '', tag: null, notes: '',
 };
@@ -476,6 +493,205 @@ export function areAllActivePlayersAllin(actingOrder: string[], state: BettingSt
   return active.length >= 2 && active.every(a => state.allInActors.has(a));
 }
 
+// ── Hand outcome ─────────────────────────────────────────────────────────────
+// Single source of truth for "is the hand over, and how" — used by both the
+// Result step and the hand-history export so they never disagree. This is
+// NOT the same question as "did any villain ever fold" (a villain folding on
+// an earlier street in a multi-way pot doesn't end the hand while others are
+// still contesting) — it only counts as fold-ended when every named villain
+// has folded, leaving Hero the lone survivor. Otherwise, however the last
+// street's action wrapped up (checks through, or an all-in call + runout),
+// it's a genuine showdown among whoever is still live.
+export interface HandOutcome {
+  situation: 'hero_folded' | 'villain_folded' | 'showdown';
+  // Villains still in the hand at the end (i.e. never folded) — the ones
+  // relevant for a showdown: villain-card entry and "who won?" options.
+  liveVillains: string[];
+}
+
+export function computeHandOutcome(draft: HandDraft): HandOutcome {
+  const namedVillains = draft.villainSeats.map((_, i) => `villain${i + 1}`);
+
+  const sbBB    = draft.bigBlind > 0 ? draft.smallBlind / draft.bigBlind : 0.5;
+  const stradBB = draft.straddleEnabled && draft.bigBlind > 0 ? draft.straddleAmount / draft.bigBlind : 0;
+  const actorOrder = getFullPreflopActorOrder(draft.playerCount, draft.heroSeat, draft.villainSeats);
+  const initInv     = buildPreflopInvestments(actorOrder, sbBB, stradBB, draft.playerCount);
+  const pf    = computePreflopState(draft.preflopActions, sbBB, stradBB, initInv);
+  const flop  = computeStreetState(draft.flopActions, pf.potBB);
+  const turn  = computeStreetState(draft.turnActions, flop.potBB);
+  const river = computeStreetState(draft.riverActions, turn.potBB);
+  const everFolded = new Set([...pf.foldedActors, ...flop.foldedActors, ...turn.foldedActors, ...river.foldedActors]);
+
+  const liveVillains = namedVillains.filter(v => !everFolded.has(v));
+
+  const situation: HandOutcome['situation'] =
+    draft.heroFolded || everFolded.has('hero') ? 'hero_folded'
+    : liveVillains.length === 0 ? 'villain_folded'
+    : 'showdown';
+
+  return { situation, liveVillains };
+}
+
+// ── Hand math ────────────────────────────────────────────────────────────────
+// Shared pot/investment book-keeping — used by the text export and the
+// visual share-card so they can never disagree on a pot size or street
+// order. Ante is dead money entering the pot before any preflop action, so
+// it's added on top of what computePreflopState tracks (blinds/straddle +
+// actions only). "BB Ante" is one full BB posted once for the table; a flat
+// "Ante" is posted per seat.
+export interface HandMath {
+  actorOrder: string[];
+  pf: BettingState;
+  pfPotBB: number;
+  flop: BettingState;
+  turn: BettingState;
+  river: BettingState;
+  finalPotBB: number;
+  priorFlop: Record<string, number>;
+  priorTurn: Record<string, number>;
+  priorRiver: Record<string, number>;
+  anteTotalBB: number;
+}
+
+export function computeHandMath(draft: HandDraft): HandMath {
+  const sbBB    = draft.bigBlind > 0 ? draft.smallBlind / draft.bigBlind : 0.5;
+  const stradBB = draft.straddleEnabled && draft.bigBlind > 0 ? draft.straddleAmount / draft.bigBlind : 0;
+  const actorOrder = getFullPreflopActorOrder(draft.playerCount, draft.heroSeat, draft.villainSeats);
+  const initInv     = buildPreflopInvestments(actorOrder, sbBB, stradBB, draft.playerCount);
+  const pf = computePreflopState(draft.preflopActions, sbBB, stradBB, initInv);
+
+  const anteTotalBB = draft.bigBlind > 0
+    ? draft.anteType === 'bbAnte' ? draft.anteAmount / draft.bigBlind
+      : draft.anteType === 'ante' ? (draft.anteAmount * draft.playerCount) / draft.bigBlind
+      : 0
+    : 0;
+  const pfPotBB = pf.potBB + anteTotalBB;
+
+  const flop  = computeStreetState(draft.flopActions, pfPotBB);
+  const turn  = computeStreetState(draft.turnActions, flop.potBB);
+  const river = computeStreetState(draft.riverActions, turn.potBB);
+
+  const combine = (...maps: Record<string, number>[]) => {
+    const out: Record<string, number> = {};
+    for (const m of maps) for (const k in m) out[k] = (out[k] ?? 0) + m[k];
+    return out;
+  };
+  const priorFlop  = combine(pf.investedBB);
+  const priorTurn  = combine(pf.investedBB, flop.investedBB);
+  const priorRiver = combine(pf.investedBB, flop.investedBB, turn.investedBB);
+
+  const finalPotBB = draft.riverCard ? river.potBB
+    : draft.turnCard ? turn.potBB
+    : draft.flopCards.some(Boolean) ? flop.potBB
+    : pfPotBB;
+
+  return { actorOrder, pf, pfPotBB, flop, turn, river, finalPotBB, priorFlop, priorTurn, priorRiver, anteTotalBB };
+}
+
+// When the hand ends in a fold, only the pot as it stood BEFORE the final
+// bet/raise actually changes hands — an uncalled bet was never matched, so
+// it just returns to whoever put it in rather than being "won." Shared by
+// the text export and the visual share card.
+// Shared scan for both computePotBeforeDecisiveFold (below) and the share
+// card's net-profit figure — finds the last street with a decisive fold and
+// recomputes that street up to (but not including) the uncalled bet/raise
+// that ended the hand, returning both the pot at that point AND every
+// actor's own investment at that point. The two numbers have to come from
+// the same cut or a fold-win's profit figure double-counts the uncalled bet
+// (once by excluding it from the pot, once by still counting it as "hero
+// invested" even though it was never actually lost — it just returns).
+function decisiveFoldState(draft: HandDraft, math: HandMath): { potBB: number; investedBB: Record<string, number> } {
+  const sbBB    = draft.bigBlind > 0 ? draft.smallBlind / draft.bigBlind : 0.5;
+  const stradBB = draft.straddleEnabled && draft.bigBlind > 0 ? draft.straddleAmount / draft.bigBlind : 0;
+  const initInv = buildPreflopInvestments(math.actorOrder, sbBB, stradBB, draft.playerCount);
+  const streets: { acts: ActionEntry[]; recompute: (a: ActionEntry[]) => { potBB: number; investedBB: Record<string, number> }; prior: Record<string, number> }[] = [
+    { acts: draft.riverActions,   recompute: (a) => computeStreetState(a, math.turn.potBB), prior: combineInvested(math.pf, math.flop, math.turn) },
+    { acts: draft.turnActions,    recompute: (a) => computeStreetState(a, math.flop.potBB), prior: combineInvested(math.pf, math.flop) },
+    { acts: draft.flopActions,    recompute: (a) => computeStreetState(a, math.pfPotBB),    prior: combineInvested(math.pf) },
+    { acts: draft.preflopActions, recompute: (a) => { const s = computePreflopState(a, sbBB, stradBB, initInv); return { potBB: s.potBB + math.anteTotalBB, investedBB: s.investedBB }; }, prior: {} },
+  ];
+  for (const s of streets) {
+    let foldIdx = -1;
+    for (let i = s.acts.length - 1; i >= 0; i--) {
+      const e = s.acts[i];
+      if (e.action === 'fold' && (e.actor === 'hero' || e.actor.startsWith('villain'))) { foldIdx = i; break; }
+    }
+    if (foldIdx === -1) continue;
+    const priorAction = s.acts[foldIdx - 1];
+    const cutIdx = priorAction && (priorAction.action === 'bet' || priorAction.action === 'raise' || priorAction.action === 'allin')
+      ? foldIdx - 1 : foldIdx;
+    const { potBB, investedBB } = s.recompute(s.acts.slice(0, cutIdx));
+    const combined: Record<string, number> = { ...s.prior };
+    for (const k in investedBB) combined[k] = (combined[k] ?? 0) + investedBB[k];
+    return { potBB, investedBB: combined };
+  }
+  const totalInvested = combineInvested(math.pf, math.flop, math.turn, math.river);
+  return { potBB: math.finalPotBB, investedBB: totalInvested };
+}
+
+function combineInvested(...states: BettingState[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const s of states) for (const k in s.investedBB) out[k] = (out[k] ?? 0) + s.investedBB[k];
+  return out;
+}
+
+export function computePotBeforeDecisiveFold(draft: HandDraft, math: HandMath): number {
+  return decisiveFoldState(draft, math).potBB;
+}
+
+// Hero's net BB result when the hand ended via fold and Hero is the
+// survivor — the pot Hero actually collects minus what Hero themself put in
+// to get it (using the SAME cut point as the pot above, so an uncalled bet
+// Hero made is neither "lost" nor double-subtracted).
+export function computeFoldWinNet(draft: HandDraft, math: HandMath): number {
+  const { potBB, investedBB } = decisiveFoldState(draft, math);
+  return potBB - (investedBB['hero'] ?? 0);
+}
+
+// Returns true when ≤1 active (non-folded) player can still bet entering this street.
+// This covers: both all-in preflop, one all-in + other called, etc.
+export function shouldSkipStreetAction(
+  draft: HandDraft,
+  street: 'flop' | 'turn' | 'river',
+  actingOrder: string[],  // named non-preflop-folded actors
+): boolean {
+  const sbBB   = draft.bigBlind > 0 ? draft.smallBlind / draft.bigBlind : 0.5;
+  const stradBB= draft.straddleEnabled && draft.bigBlind > 0 ? draft.straddleAmount / draft.bigBlind : 0;
+  const ao     = getFullPreflopActorOrder(draft.playerCount, draft.heroSeat, draft.villainSeats);
+  const initInv= buildPreflopInvestments(ao, sbBB, stradBB, draft.playerCount);
+  const pf     = computePreflopState(draft.preflopActions, sbBB, stradBB, initInv);
+
+  // Live entering flop = those not folded or all-in preflop
+  const liveAfterPf = actingOrder.filter(a => !pf.allInActors.has(a) && !pf.foldedActors.has(a));
+  if (liveAfterPf.length <= 1) return true;
+  if (street === 'flop') return false;
+
+  const basePot = pf.potBB;
+  const flopSt  = computeStreetState(draft.flopActions, basePot);
+  const liveAfterFlop = liveAfterPf.filter(a => !flopSt.allInActors.has(a) && !flopSt.foldedActors.has(a));
+  if (liveAfterFlop.length <= 1) return true;
+  if (street === 'turn') return false;
+
+  const turnSt = computeStreetState(draft.turnActions, flopSt.potBB);
+  const liveAfterTurn = liveAfterFlop.filter(a => !turnSt.allInActors.has(a) && !turnSt.foldedActors.has(a));
+  return liveAfterTurn.length <= 1;
+}
+
+// A street with zero recorded actions is ambiguous — it could mean everyone
+// checked (real actions, just no chips) or it could mean the street was
+// never actually played because someone was already all-in. Only the
+// latter should say so instead of the misleading "Checked through".
+export function isAllInRunout(draft: HandDraft, street: 'flop' | 'turn' | 'river'): boolean {
+  const sbBB    = draft.bigBlind > 0 ? draft.smallBlind / draft.bigBlind : 0.5;
+  const stradBB = draft.straddleEnabled && draft.bigBlind > 0 ? draft.straddleAmount / draft.bigBlind : 0;
+  const pfActorOrder = getFullPreflopActorOrder(draft.playerCount, draft.heroSeat, draft.villainSeats);
+  const pfInitInv     = buildPreflopInvestments(pfActorOrder, sbBB, stradBB, draft.playerCount);
+  const pfState       = computePreflopState(draft.preflopActions, sbBB, stradBB, pfInitInv);
+  const allNamed      = getStreetActors(draft.heroSeat, draft.villainSeats, draft.playerCount, 'postflop');
+  const actingOrder    = allNamed.filter(a => !pfState.foldedActors.has(a));
+  return shouldSkipStreetAction(draft, street, actingOrder);
+}
+
 // ── Card / label helpers ─────────────────────────────────────────────────────
 
 export const RANKS: Rank[] = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
@@ -488,10 +704,80 @@ export const SUIT_COLORS: Record<Suit, string> = {
 
 export function cardLabel(c: CardType): string { return `${c.rank}${c.suit}`; }
 
+// Every number formatter below is guaranteed to return a plain, finite,
+// renderable string no matter what it's handed — undefined/null/NaN/a
+// non-numeric value all fall back to 0 rather than throwing. These feed
+// directly into the share card and hand-review screen, which are rendered
+// off-screen for react-native-view-shot to capture; a thrown error there
+// doesn't show a red-screen, it just leaves the capture promise hanging
+// forever with nothing to show for it.
+function safeNum(n: unknown): number {
+  return typeof n === 'number' && Number.isFinite(n) ? n : 0;
+}
+
+export function fmtSize(n: number): string {
+  const v = safeNum(n);
+  return v % 1 === 0 ? v.toFixed(0) : v.toFixed(1);
+}
+
+// K/M-compact formatter — any raw amount (pot, bet, stack, result) of 1000
+// or more always renders this way, never as a bare number. Shows only as
+// many decimals as the value actually needs (up to 2), so 1000 → "1K",
+// 1500 → "1.5K", 1250 → "1.25K".
+export function fmtCompact(n: number): string {
+  const num = safeNum(n);
+  const sign = num < 0 ? '-' : '';
+  const abs = Math.abs(num);
+  if (abs < 1000) return `${sign}${fmtSize(abs)}`;
+  const trim = (v: number) => String(parseFloat(v.toFixed(2)));
+  if (abs >= 1_000_000) return `${sign}${trim(abs / 1_000_000)}M`;
+  const asK = abs / 1000;
+  // Rounding can tip a number just under 1M (e.g. 999,999.6) up to "1000K" —
+  // bump it to the next unit instead.
+  if (parseFloat(trim(asK)) >= 1000) return `${sign}1M`;
+  return `${sign}${trim(asK)}K`;
+}
+
+// The one place every pot/bet/stack amount in the hand-logging and review
+// flow should go through — never the bare word "chips", and never a raw
+// number ≥1000 without K/M notation. When the hand is tracked in BB only,
+// that's all this returns ("6.5BB"). Once the user opts to also see the raw
+// unit (stackUnit === 'Chips'), a cash hand gets a $ sign and a tournament
+// gets a bare (compact) number, both followed by the BB equivalent in
+// brackets — e.g. "$1.3K (13BB)" or "1.3K (6.5BB)".
+export function fmtDualAmount(
+  bb: number,
+  opts: { stackUnit: StackUnit; bigBlind: number; gameType: GameType | null }
+): string {
+  const safeBB = safeNum(bb);
+  const bbText = `${fmtSize(safeBB)}BB`;
+  if (!(opts.stackUnit === 'Chips' && safeNum(opts.bigBlind) > 0)) return bbText;
+  const raw = safeBB * safeNum(opts.bigBlind);
+  const rawText = opts.gameType === 'cash' ? `$${fmtCompact(raw)}` : fmtCompact(raw);
+  return `${rawText} (${bbText})`;
+}
+
 export function holeCardsLabel(c1: CardType | null, c2: CardType | null): string {
   if (!c1 || !c2) return '??';
   if (c1.rank === c2.rank) return `${c1.rank}${c2.rank}`;
   return `${c1.rank}${c2.rank}${c1.suit === c2.suit ? 's' : 'o'}`;
+}
+
+// Display name for a villain actor ('villain1', 'villain2', ...) — the
+// nickname entered on the Position step if there is one, else "Villain N".
+// Single source of truth so a rename shows up in every action display, the
+// export, and the review screen without touching each one individually.
+export function villainLabel(vKey: string, villainNames: Record<string, string> | undefined): string {
+  const custom = villainNames?.[vKey]?.trim();
+  if (custom) return custom;
+  const n = parseInt(vKey.replace('villain', ''), 10);
+  return `Villain ${n}`;
+}
+
+// Display name for Hero — the nickname entered on the Position step if
+// there is one, else "Hero". Mirrors villainLabel above.
+export function heroLabel(heroName: string | undefined): string {
+  return heroName?.trim() || 'Hero';
 }
 
 export function inferPotType(raiseCount: number, hasAllIn: boolean): string {
@@ -503,10 +789,37 @@ export function inferPotType(raiseCount: number, hasAllIn: boolean): string {
   return `${raiseCount + 1}-Bet`;
 }
 
+// The villain to feature in the hand's title/name — whoever was still live
+// (never folded) at the end, not just whichever villain happened to be
+// entered first. A 3-way pot where the first villain added folds early and
+// a later one goes to showdown with Hero should read "BTN vs SB", never
+// "BTN vs CO" just because CO was villain #1. Falls back to whichever
+// villain acted most recently when everyone's folded (Hero won by fold) —
+// still more meaningful than an arbitrary first-entered seat.
+function featuredVillainSeat(draft: HandDraft): number | null {
+  const { liveVillains } = computeHandOutcome(draft);
+  if (liveVillains.length > 0) {
+    const vi = parseInt(liveVillains[0].replace('villain', ''), 10) - 1;
+    return draft.villainSeats[vi] ?? null;
+  }
+  const streets = [draft.riverActions, draft.turnActions, draft.flopActions, draft.preflopActions];
+  for (const acts of streets) {
+    for (let i = acts.length - 1; i >= 0; i--) {
+      const a = acts[i].actor;
+      if (a.startsWith('villain')) {
+        const vi = parseInt(a.replace('villain', ''), 10) - 1;
+        return draft.villainSeats[vi] ?? null;
+      }
+    }
+  }
+  return draft.villainSeats[0] ?? null;
+}
+
 export function autoHandName(draft: HandDraft): string {
   const labels = POSITION_LABELS[draft.playerCount] ?? [];
   const heroPos = draft.heroSeat !== null ? (labels[draft.heroSeat] ?? '?') : '?';
-  const villPos = draft.villainSeats.length > 0 ? (labels[draft.villainSeats[0]] ?? '?') : '?';
+  const villSeat = featuredVillainSeat(draft);
+  const villPos = villSeat !== null ? (labels[villSeat] ?? '?') : '?';
   const cards   = holeCardsLabel(draft.card1, draft.card2);
   return `${heroPos} vs ${villPos} — ${cards} — ${draft.potType || 'SRP'}`;
 }

@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { HandRecord, INITIAL_REVIEW, migrateRecord } from '@/components/hand-review/types';
-import { HandDraft, POSITION_LABELS, holeCardsLabel } from '@/components/log-hand/types';
+import { HandDraft, POSITION_LABELS, holeCardsLabel, villainLabel, heroLabel } from '@/components/log-hand/types';
 
 const STORAGE_KEY = 'hands_v1';
 
@@ -37,7 +37,7 @@ export function draftToRecord(draft: HandDraft, id: string, createdAt: string): 
   const labels  = POSITION_LABELS[draft.playerCount] ?? [];
   const heroPos = draft.heroSeat !== null ? (labels[draft.heroSeat] ?? 'Hero') : 'Hero';
   const villPos = draft.villainSeats.length > 0
-    ? draft.villainSeats.map((s, i) => `V${i + 1}(${labels[s] ?? '?'})`).join(', ')
+    ? draft.villainSeats.map((s, i) => `${villainLabel(`villain${i + 1}`, draft.villainNames)}(${labels[s] ?? '?'})`).join(', ')
     : '?';
 
   return {
@@ -46,7 +46,7 @@ export function draftToRecord(draft: HandDraft, id: string, createdAt: string): 
     review:           { ...INITIAL_REVIEW },
     status:           'unreviewed',
     createdAt,
-    displayPositions: `${heroPos} vs ${villPos}`,
+    displayPositions: `${heroLabel(draft.heroName)} (${heroPos}) vs ${villPos}`,
     displayHoleCards: holeCardsLabel(draft.card1, draft.card2),
     displayPotType:   draft.potType || 'SRP',
     displayStreet:    inferLastStreet(draft),

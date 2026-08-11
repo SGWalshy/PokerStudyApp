@@ -1,4 +1,4 @@
-import { HandRecord, MistakeCategory, MISTAKE_CATEGORIES } from '@/components/hand-review/types';
+import { HandRecord } from '@/components/hand-review/types';
 import { BankrollTransaction } from '@/utils/bankroll-storage';
 import { WeeklyGoalTargets } from '@/utils/goals-storage';
 
@@ -204,38 +204,6 @@ export function weeklyHistory(hands: HandRecord[], targets: WeeklyGoalTargets, w
   return entries;
 }
 
-// ── Leaks ────────────────────────────────────────────────────────────────────
-
-export interface LeakStat {
-  category: MistakeCategory;
-  label: string;
-  pct: number;
-}
-
-const MISTAKE_LABELS: Record<MistakeCategory, string> = Object.fromEntries(
-  MISTAKE_CATEGORIES.map(c => [c.key, c.label])
-) as Record<MistakeCategory, string>;
-
-export function topLeaks(hands: HandRecord[], limit = 2): LeakStat[] {
-  const reviewed = hands.filter(h => h.status === 'reviewed');
-  if (reviewed.length === 0) return [];
-
-  const counts = new Map<MistakeCategory, number>();
-  for (const h of reviewed) {
-    for (const cat of h.review.mistakeCategories) {
-      counts.set(cat, (counts.get(cat) ?? 0) + 1);
-    }
-  }
-
-  return [...counts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, limit)
-    .map(([category, count]) => ({
-      category,
-      label: MISTAKE_LABELS[category] ?? category,
-      pct: Math.round((count / reviewed.length) * 100),
-    }));
-}
 
 // ── Bankroll ─────────────────────────────────────────────────────────────────
 
