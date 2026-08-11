@@ -184,7 +184,7 @@ export function EditGoalModal({ goal, onClose }: EditGoalModalProps) {
 
           {confirmingDelete ? (
             <View style={styles.confirmRow}>
-              <Text style={styles.confirmText}>Delete this goal? This can't be undone.</Text>
+              <Text style={styles.confirmText}>Delete this goal? This can&apos;t be undone.</Text>
               <View style={styles.confirmActions}>
                 <Pressable
                   onPress={() => setConfirmingDelete(false)}

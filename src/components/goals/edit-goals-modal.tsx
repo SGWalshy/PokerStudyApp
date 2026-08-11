@@ -56,7 +56,7 @@ export interface EditGoalsModalProps {
 }
 
 export function EditGoalsModal({ visible, onClose }: EditGoalsModalProps) {
-  const { activeGoals, addActiveGoal, updateActiveGoal, removeActiveGoal, stats } = useAppData();
+  const { addActiveGoal, updateActiveGoal, removeActiveGoal, stats } = useAppData();
 
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
@@ -173,7 +173,7 @@ export function EditGoalsModal({ visible, onClose }: EditGoalsModalProps) {
               <View style={styles.emptyActive}>
                 <Text style={styles.emptyActiveIcon}>🌱</Text>
                 <Text style={styles.emptyActiveText}>
-                  Nothing here yet — add a goal below and it'll show up here, tracked automatically.
+                  Nothing here yet — add a goal below and it&apos;ll show up here, tracked automatically.
                 </Text>
               </View>
             ) : (

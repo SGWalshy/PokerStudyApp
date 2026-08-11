@@ -129,7 +129,7 @@ export default function GroupsScreen() {
               <View style={styles.emptyState}>
                 <Text style={styles.emptyIcon}>♠</Text>
                 <Text style={styles.emptyTitle}>No hands shared yet</Text>
-                <Text style={styles.emptySub}>Share a logged hand to start this group's feed</Text>
+                <Text style={styles.emptySub}>Share a logged hand to start this group&apos;s feed</Text>
               </View>
             ) : (
               activeRoom.sharedHands.map((shared) => {

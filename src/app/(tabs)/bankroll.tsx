@@ -409,7 +409,7 @@ export default function BankrollScreen() {
             <View style={styles.emptyState}>
               <Text style={styles.emptyIcon}>♠</Text>
               <Text style={styles.emptyTitle}>No sessions yet</Text>
-              <Text style={styles.emptySub}>Tap "+ Add" to log your first session</Text>
+              <Text style={styles.emptySub}>Tap &quot;+ Add&quot; to log your first session</Text>
             </View>
           ) : (
             <View style={styles.sessionList}>
@@ -836,7 +836,7 @@ export default function BankrollScreen() {
               </Pressable>
             </View>
 
-            <Text style={styles.sheetSub}>What's your bankroll worth right now?</Text>
+            <Text style={styles.sheetSub}>What&apos;s your bankroll worth right now?</Text>
 
             <TextInput
               style={styles.formInput}

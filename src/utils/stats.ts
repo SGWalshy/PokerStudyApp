@@ -204,7 +204,6 @@ export function weeklyHistory(hands: HandRecord[], targets: WeeklyGoalTargets, w
   return entries;
 }
 
-
 // ── Bankroll ─────────────────────────────────────────────────────────────────
 
 export interface BankrollTotals {

@@ -288,6 +288,13 @@ export function computeSidePots(
   return pots;
 }
 
+// Replays the preflop action log into a running BettingState. The one
+// non-obvious rule it enforces is minimum-raise reopening: a raise/all-in
+// only resets `lastRaiseInc` (and clears `subMinAllIn`) when its increase
+// over the current bet is at least the previous raise's increase — an
+// all-in for LESS than a full raise (`subMinAllIn`) still puts more chips
+// in, but doesn't reopen betting for players who already called/matched
+// the prior bet, matching standard no-limit rules.
 export function computePreflopState(
   actions: ActionEntry[],
   smallBlindBB: number,
@@ -368,6 +375,9 @@ export function computePreflopState(
   };
 }
 
+// Postflop counterpart to computePreflopState — same replay/reopening logic
+// above, just starting from an empty bet (no blinds already in) and the
+// street's carried-over pot instead of blind/straddle investments.
 export function computeStreetState(
   actions: ActionEntry[],
   startingPotBB: number,
@@ -553,6 +563,10 @@ export interface HandMath {
   anteTotalBB: number;
 }
 
+// Replays every street in order, feeding each one's ending pot into the
+// next, so the whole hand's betting state only ever needs computing once —
+// every other derived figure (pot displays, results, the share card) reads
+// from this instead of re-replaying the action log itself.
 export function computeHandMath(draft: HandDraft): HandMath {
   const sbBB    = draft.bigBlind > 0 ? draft.smallBlind / draft.bigBlind : 0.5;
   const stradBB = draft.straddleEnabled && draft.bigBlind > 0 ? draft.straddleAmount / draft.bigBlind : 0;

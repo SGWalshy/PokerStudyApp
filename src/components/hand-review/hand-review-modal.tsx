@@ -35,7 +35,6 @@ import {
   computeHandMath,
   computeHandOutcome,
   fmtDualAmount,
-  holeCardsLabel,
   villainLabel,
   heroLabel,
 } from '../log-hand/types';
@@ -643,7 +642,6 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
     if (!draft) { try { await Share.share({ message: buildShareText() }); } catch {} return; }
     if (sharingImage) return;
     setSharingImage(true);
-    console.log('[ShareHand:Review] starting — hideVillainCards =', hideVillainCards);
     try {
       // Let the sheet's closing animation and any last-second re-render from
       // the villain-cards toggle actually flush to the native view before
@@ -651,18 +649,14 @@ export function HandReviewModal({ visible, record, allRecords, onClose, onUpdate
       // react-native-view-shot to hang instead of resolving or rejecting.
       await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       if (!viewShotRef.current?.capture) throw new Error("Share card isn't ready yet — try again in a moment.");
-      console.log('[ShareHand:Review] capturing…');
       const uri = await withTimeout(viewShotRef.current.capture(), 10000, 'Image generation timed out — please try again.');
-      console.log('[ShareHand:Review] capture returned uri:', uri);
       if (!uri) throw new Error('No image was generated — please try again.');
       // Capture succeeded — don't leave the button reading "Preparing…" for
       // however long the OS share sheet stays open waiting on the user.
       setSharingImage(false);
       const canShare = await Sharing.isAvailableAsync();
-      console.log('[ShareHand:Review] Sharing.isAvailableAsync ->', canShare);
       if (canShare) {
         await Sharing.shareAsync(uri, { mimeType: 'image/png', dialogTitle: 'Share Hand' });
-        console.log('[ShareHand:Review] shareAsync resolved (sheet closed)');
       } else {
         Alert.alert("Sharing isn't available", 'This device has no share sheet to send the image through.');
       }

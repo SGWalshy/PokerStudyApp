@@ -341,7 +341,7 @@ export default function HandsScreen() {
                 </Text>
                 {records.length === 0 && (
                   <Text style={styles.emptyHint}>
-                    Tap "+ Log Hand" to record your first hand.
+                    Tap &quot;+ Log Hand&quot; to record your first hand.
                   </Text>
                 )}
               </View>

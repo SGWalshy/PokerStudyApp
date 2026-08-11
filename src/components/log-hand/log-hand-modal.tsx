@@ -39,7 +39,6 @@ import {
   INITIAL_DRAFT,
   POSITION_LABELS,
   Rank,
-  ResultType,
   autoHandName,
   cardLabel,
   buildPreflopInvestments,
@@ -1489,7 +1488,7 @@ function StepCards({ draft, set, onNext, onSkip }: StepProps & { onSkip: () => v
   return (
     <StepScroll>
       <CardPicker cards={[draft.card1, draft.card2]} activeSlot={slot} onSlotPress={setSlot}
-        onCardPicked={(i, c) => { i === 0 ? set({ card1: c }) : set({ card2: c }); }}
+        onCardPicked={(i, c) => { if (i === 0) set({ card1: c }); else set({ card2: c }); }}
         onClear={(i) => i === 0 ? set({ card1: null }) : set({ card2: null })}
         onAllFilled={onNext}
         onPendingChange={setPending} />
@@ -2472,7 +2471,7 @@ function StepNameTag({ draft, set, onSave, onFocusScroll, onOpenShareSheet, shar
         <TextInput style={styles.nameInput} placeholder={auto} placeholderTextColor={C.textSecondary}
           value={draft.handName} onChangeText={(v) => set({ handName: v })} maxLength={80} returnKeyType="done"
           onSubmitEditing={() => Keyboard.dismiss()} onFocus={onFocusScroll} />
-        <Text style={styles.nameHint}>Leave blank to auto-generate: "{auto}"</Text>
+        <Text style={styles.nameHint}>Leave blank to auto-generate: &quot;{auto}&quot;</Text>
       </FadeSlideIn>
       <FadeSlideIn delay={50} style={{ gap: 14 }}>
         <Label text="Notes" />
@@ -2720,7 +2719,6 @@ export function LogHandModal({ visible, onClose, onSave, initialDraft }: LogHand
   const handleShareImage = async () => {
     if (sharingImage) return;
     setSharingImage(true);
-    console.log('[ShareHand:TagSave] starting — hideVillainCards =', hideVillainCards);
     try {
       // Let the sheet's closing animation and any last-second re-render from
       // the villain-cards toggle actually flush to the native view before
@@ -2728,18 +2726,14 @@ export function LogHandModal({ visible, onClose, onSave, initialDraft }: LogHand
       // react-native-view-shot to hang instead of resolving or rejecting.
       await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       if (!viewShotRef.current?.capture) throw new Error("Share card isn't ready yet — try again in a moment.");
-      console.log('[ShareHand:TagSave] capturing…');
       const uri = await withTimeout(viewShotRef.current.capture(), 10000, 'Image generation timed out — please try again.');
-      console.log('[ShareHand:TagSave] capture returned uri:', uri);
       if (!uri) throw new Error('No image was generated — please try again.');
       // Capture succeeded — don't leave the button reading "Preparing…" for
       // however long the OS share sheet stays open waiting on the user.
       setSharingImage(false);
       const canShare = await Sharing.isAvailableAsync();
-      console.log('[ShareHand:TagSave] Sharing.isAvailableAsync ->', canShare);
       if (canShare) {
         await Sharing.shareAsync(uri, { mimeType: 'image/png', dialogTitle: 'Share Hand' });
-        console.log('[ShareHand:TagSave] shareAsync resolved (sheet closed)');
       } else {
         Alert.alert("Sharing isn't available", 'This device has no share sheet to send the image through.');
       }

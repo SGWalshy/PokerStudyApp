@@ -8,6 +8,9 @@ const RANK_VALUE: Record<Rank, number> = {
   A: 14, K: 13, Q: 12, J: 11, T: 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3, '2': 2,
 };
 
+// All k-length subsets of items, via classic include/exclude recursion on
+// the first element. Used to try every 5-card subset of a 7-card hand
+// (2 hole + 5 board) and keep whichever scores best.
 function combinations<T>(items: T[], k: number): T[][] {
   if (k === 0) return [[]];
   if (items.length < k) return [];
@@ -35,19 +38,22 @@ function evaluate5(cards: CardType[]): number[] {
     else if (uniqueDesc.join(',') === '14,5,4,3,2') { isStraight = true; straightHigh = 5; } // wheel: A-2-3-4-5
   }
 
-  if (isStraight && isFlush) return [8, straightHigh];
-  if (groups[0].c === 4) return [7, groups[0].r, groups[1].r];
-  if (groups[0].c === 3 && groups[1].c === 2) return [6, groups[0].r, groups[1].r];
-  if (isFlush) return [5, ...ranks];
-  if (isStraight) return [4, straightHigh];
-  if (groups[0].c === 3) return [3, groups[0].r, ...groups.slice(1).map(g => g.r)];
-  if (groups[0].c === 2 && groups[1].c === 2) {
+  // `groups` is rank-counts sorted by count then rank, so groups[0] is
+  // always the biggest/highest group — e.g. a full house is groups[0].c===3
+  // (the trips) followed by groups[1].c===2 (the pair).
+  if (isStraight && isFlush) return [8, straightHigh];       // straight flush
+  if (groups[0].c === 4) return [7, groups[0].r, groups[1].r]; // four of a kind
+  if (groups[0].c === 3 && groups[1].c === 2) return [6, groups[0].r, groups[1].r]; // full house
+  if (isFlush) return [5, ...ranks];                          // flush
+  if (isStraight) return [4, straightHigh];                   // straight
+  if (groups[0].c === 3) return [3, groups[0].r, ...groups.slice(1).map(g => g.r)]; // three of a kind
+  if (groups[0].c === 2 && groups[1].c === 2) {                // two pair
     const pairHigh = Math.max(groups[0].r, groups[1].r);
     const pairLow = Math.min(groups[0].r, groups[1].r);
     return [2, pairHigh, pairLow, groups[2].r];
   }
-  if (groups[0].c === 2) return [1, groups[0].r, ...groups.slice(1).map(g => g.r)];
-  return [0, ...ranks];
+  if (groups[0].c === 2) return [1, groups[0].r, ...groups.slice(1).map(g => g.r)]; // one pair
+  return [0, ...ranks];                                        // high card
 }
 
 function compareScores(a: number[], b: number[]): number {
